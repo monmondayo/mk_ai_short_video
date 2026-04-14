@@ -7,6 +7,8 @@ Usage: python -m mkvideo.cli <youtube_url> [options]
 
 import argparse
 import json
+import os
+import subprocess
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -27,7 +29,12 @@ from .pipeline.render import (
     scan_input_images,
 )
 from .pipeline.stories import enforce_story_duration_range, extract_stories
-from .pipeline.transcribe import proofread_transcript, transcribe_video
+from .pipeline.transcribe import (
+    export_review_txt,
+    import_review_txt,
+    proofread_transcript,
+    transcribe_video,
+)
 
 # Load .env from project root so API keys are available
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -57,6 +64,10 @@ def main():
                              "Use 'en' for English, or leave empty for auto-detect.")
     parser.add_argument("--no-proofread", action="store_true",
                         help="Skip Claude AI proofreading of the transcript")
+    parser.add_argument("--review-transcript", action="store_true",
+                        help="Pause after transcription to manually edit the transcript")
+    parser.add_argument("--review-subtitles", action="store_true",
+                        help="Pause after subtitle generation to manually edit SRT files")
     parser.add_argument("--bg-color", default="white", choices=["black", "white"],
                         help="Background color (default: white)")
     parser.add_argument("--no-captions", action="store_true",
@@ -87,8 +98,8 @@ def main():
         transcript = transcribe_video(video_path, model_name=args.whisper_model, language=whisper_lang)
         cache.write_text(json.dumps(transcript, ensure_ascii=False, indent=2))
 
+    proofread_cache = TEMP_DIR / f"{video_path.stem}_transcript_proofread_{cache_suffix}.json"
     if not args.no_proofread:
-        proofread_cache = TEMP_DIR / f"{video_path.stem}_transcript_proofread_{cache_suffix}.json"
         if proofread_cache.exists():
             print(f"\n[2/5] Loading cached proofread transcript...")
             transcript = json.loads(proofread_cache.read_text())
@@ -96,6 +107,23 @@ def main():
             print(f"\n[2/5] Proofreading transcript...")
             transcript = proofread_transcript(transcript)
             proofread_cache.write_text(json.dumps(transcript, ensure_ascii=False, indent=2))
+
+    if args.review_transcript:
+        review_path = TEMP_DIR / f"{video_path.stem}_review.txt"
+        export_review_txt(transcript, review_path)
+        print(f"\n[Review] トランスクリプト確認・修正")
+        print(f"   ファイル: {review_path.resolve()}")
+        editor = os.environ.get("EDITOR")
+        if editor:
+            print(f"   エディタ ({editor}) で開きます...")
+            subprocess.run([editor, str(review_path)])
+        else:
+            print("   ファイルを編集したら Enter を押してください")
+            input()
+        transcript = import_review_txt(review_path, transcript)
+        save_to = proofread_cache if not args.no_proofread else cache
+        save_to.write_text(json.dumps(transcript, ensure_ascii=False, indent=2))
+        print("   修正済みトランスクリプトをキャッシュに保存しました")
 
     info = get_video_info(video_path)
 
@@ -143,6 +171,7 @@ def main():
         add_captions=not args.no_captions,
         input_images=input_images,
         video_title=video_title,
+        review_subtitles=args.review_subtitles,
     )
 
     print(f"\n[5/5] Done! {len(output_paths)}/{len(stories)} stories -> {out_dir.resolve()}")
