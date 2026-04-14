@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from pathlib import Path
 
 import anthropic
@@ -112,3 +113,43 @@ def proofread_transcript(transcript: dict) -> dict:
         "text": "".join(s["text"] for s in corrected_segments),
         "segments": corrected_segments,
     }
+
+
+# ──────────────────────────────────────────
+# Step 2.6: Manual transcript review
+# ──────────────────────────────────────────
+def export_review_txt(transcript: dict, path: Path) -> None:
+    """Export transcript segments to a plain-text file for manual editing."""
+    lines = ["# 誤字を修正してください。=== の行は変更しないでください。\n"]
+    for i, seg in enumerate(transcript["segments"]):
+        t0, t1 = seg["start"], seg["end"]
+        lines.append(f"=== {i} [{t0:.1f}s - {t1:.1f}s] ===")
+        lines.append(seg["text"])
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def import_review_txt(path: Path, transcript: dict) -> dict:
+    """Read back an edited review file and update transcript segment texts."""
+    header_re = re.compile(r"^=== (\d+) \[[\d.]+s - [\d.]+s\] ===$")
+    segments = [dict(s) for s in transcript["segments"]]
+    current_idx: int | None = None
+    current_lines: list[str] = []
+
+    def flush() -> None:
+        if current_idx is not None and current_idx < len(segments):
+            text = "\n".join(current_lines).strip()
+            if text:
+                segments[current_idx]["text"] = text
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = header_re.match(line)
+        if m:
+            flush()
+            current_idx = int(m.group(1))
+            current_lines = []
+        elif current_idx is not None and not line.startswith("#"):
+            current_lines.append(line)
+    flush()
+
+    return {"text": "".join(s["text"] for s in segments), "segments": segments}

@@ -604,6 +604,7 @@ def add_overlays(
     add_captions: bool,
     input_images: list[Path],
     video_title: str = "",
+    srt_content: str | None = None,
 ) -> None:
     rank = story["rank"]
 
@@ -612,7 +613,8 @@ def add_overlays(
     inputs = ["-i", str(joined_path), "-i", str(upper_png)]
 
     if add_captions:
-        srt_content = build_story_srt(story["segments"], transcript_segs, clip_durations)
+        if srt_content is None:
+            srt_content = build_story_srt(story["segments"], transcript_segs, clip_durations)
         entries = parse_srt(srt_content)
         total_dur = get_clip_duration(joined_path)
         sub_video, sub_y = create_subtitle_video(
@@ -656,26 +658,18 @@ def find_natural_end(
     return end_time
 
 
-def render_story(
+def _prepare_story(
     story: dict,
     video_path: Path,
     transcript_segs: list[dict],
-    out_dir: Path,
     work_dir: Path,
     bg_color: str,
     add_captions: bool,
-    input_images: list[Path],
     max_total_duration: float,
-    video_title: str = "",
-) -> Path:
+) -> tuple[Path, list[float], str]:
+    """Cut segments, join, and generate SRT. Returns (joined_path, durations, srt_content)."""
     rank = story["rank"]
     segs = story["segments"]
-    transitions = [s.get("transition_in", "dissolve") for s in segs[1:]]
-
-    safe_title = "".join(
-        c if c.isalnum() or c in " -_" else "_" for c in story["title"]
-    )[:50].strip()
-    out_path = out_dir / f"{rank:02d}_{safe_title}.mp4"
 
     segment_times: list[tuple[float, float]] = []
     for i, seg in enumerate(segs):
@@ -704,9 +698,40 @@ def render_story(
     joined_path = work_dir / f"s{rank}_joined.mp4"
     join_segments(seg_paths, transitions, joined_path)
 
+    srt_content = ""
+    if add_captions:
+        srt_content = build_story_srt(story["segments"], transcript_segs, durations)
+        srt_path = TEMP_DIR / f"{video_path.stem}_s{rank}.srt"
+        srt_path.write_text(srt_content, encoding="utf-8")
+
+    return joined_path, durations, srt_content
+
+
+def render_story(
+    story: dict,
+    video_path: Path,
+    transcript_segs: list[dict],
+    out_dir: Path,
+    work_dir: Path,
+    bg_color: str,
+    add_captions: bool,
+    input_images: list[Path],
+    max_total_duration: float,
+    video_title: str = "",
+) -> Path:
+    rank = story["rank"]
+    safe_title = "".join(
+        c if c.isalnum() or c in " -_" else "_" for c in story["title"]
+    )[:50].strip()
+    out_path = out_dir / f"{rank:02d}_{safe_title}.mp4"
+
+    joined_path, durations, srt_content = _prepare_story(
+        story, video_path, transcript_segs, work_dir, bg_color, add_captions, max_total_duration
+    )
     add_overlays(
         joined_path, story, transcript_segs, durations,
         work_dir, out_path, bg_color, add_captions, input_images, video_title,
+        srt_content=srt_content or None,
     )
     return out_path
 
@@ -724,6 +749,7 @@ def render_all_stories(
     add_captions: bool = True,
     input_images: list[Path] = [],
     video_title: str = "",
+    review_subtitles: bool = False,
 ) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     work_dir = TEMP_DIR / "render"
@@ -739,32 +765,94 @@ def render_all_stories(
     if input_images:
         print(f"   Images:  {len(input_images)} files in input/ -> shown around subtitles")
 
+    transcript_segs = transcript["segments"]
+    max_total = max_duration + DURATION_TOLERANCE_SEC
+
+    def _stderr_tail(e: subprocess.CalledProcessError) -> str:
+        lines = [ln for ln in (e.stderr or "").splitlines() if ln.strip()]
+        return "\n      ".join(lines[-6:]) if lines else "(no stderr)"
+
+    def _safe_title(story: dict) -> str:
+        return "".join(c if c.isalnum() or c in " -_" else "_" for c in story["title"])[:50].strip()
+
     output_paths: list[Path] = []
-    for story in stories:
-        rank = story["rank"]
-        segs = story["segments"]
-        total = sum(s["end"] - s["start"] for s in segs)
-        trs = [s.get("transition_in", "dissolve") for s in segs[1:]]
-        print(
-            f"   #{rank:2d} ({len(segs)}segs ~{total:.0f}s tr={trs}) "
-            f"{story['title'][:40]}...",
-            end=" ", flush=True,
-        )
-        try:
-            p = render_story(
-                story, video_path, transcript["segments"],
-                out_dir, work_dir, bg_color, add_captions, input_images,
-                max_total_duration=max_duration + DURATION_TOLERANCE_SEC,
-                video_title=video_title,
+
+    if review_subtitles and add_captions:
+        # ── Phase 1: cut + join + generate SRT for every story ──────────────
+        print("   [Phase 1/2] セグメントカット・字幕生成中...")
+        prepared: dict[int, tuple[Path, Path, list[float]]] = {}  # rank -> (out_path, joined_path, durations)
+        for story in stories:
+            rank = story["rank"]
+            segs = story["segments"]
+            total = sum(s["end"] - s["start"] for s in segs)
+            trs = [s.get("transition_in", "dissolve") for s in segs[1:]]
+            print(f"   #{rank:2d} ({len(segs)}segs ~{total:.0f}s tr={trs}) {story['title'][:40]}...", end=" ", flush=True)
+            try:
+                joined_path, durations, _ = _prepare_story(
+                    story, video_path, transcript_segs, work_dir, bg_color, add_captions, max_total
+                )
+                out_path = out_dir / f"{rank:02d}_{_safe_title(story)}.mp4"
+                prepared[rank] = (out_path, joined_path, durations)
+                print("-> SRT生成済")
+            except subprocess.CalledProcessError as e:
+                print(f"FAILED\n      {_stderr_tail(e)}")
+
+        # ── Pause for subtitle review ────────────────────────────────────────
+        print(f"\n[Review] 字幕SRTファイルを確認・修正してください:")
+        for story in stories:
+            rank = story["rank"]
+            if rank in prepared:
+                srt_path = TEMP_DIR / f"{video_path.stem}_s{rank}.srt"
+                print(f"   #{rank:2d}: {srt_path.resolve()}")
+        print("\n   編集が完了したら Enter を押してください...")
+        input()
+
+        # ── Phase 2: overlay with (possibly edited) SRT files ───────────────
+        print("   [Phase 2/2] オーバーレイ合成中...")
+        for story in stories:
+            rank = story["rank"]
+            if rank not in prepared:
+                continue
+            out_path, joined_path, durations = prepared[rank]
+            print(f"   #{rank:2d} {story['title'][:50]}...", end=" ", flush=True)
+            try:
+                srt_path = TEMP_DIR / f"{video_path.stem}_s{rank}.srt"
+                srt_content = srt_path.read_text(encoding="utf-8") if srt_path.exists() else None
+                add_overlays(
+                    joined_path, story, transcript_segs, durations,
+                    work_dir, out_path, bg_color, add_captions, input_images, video_title,
+                    srt_content=srt_content,
+                )
+                size_mb = out_path.stat().st_size / 1024 / 1024
+                print(f"-> {out_path.name} ({size_mb:.1f} MB)")
+                output_paths.append(out_path)
+            except subprocess.CalledProcessError as e:
+                print(f"FAILED\n      {_stderr_tail(e)}")
+
+    else:
+        # ── Normal flow ──────────────────────────────────────────────────────
+        for story in stories:
+            rank = story["rank"]
+            segs = story["segments"]
+            total = sum(s["end"] - s["start"] for s in segs)
+            trs = [s.get("transition_in", "dissolve") for s in segs[1:]]
+            print(
+                f"   #{rank:2d} ({len(segs)}segs ~{total:.0f}s tr={trs}) "
+                f"{story['title'][:40]}...",
+                end=" ", flush=True,
             )
-            size_mb = p.stat().st_size / 1024 / 1024
-            print(f"-> {p.name} ({size_mb:.1f} MB)")
-            output_paths.append(p)
-        except subprocess.CalledProcessError as e:
-            stderr_text = e.stderr or ""
-            err_lines = [ln for ln in stderr_text.splitlines() if ln.strip()]
-            tail = "\n      ".join(err_lines[-6:]) if err_lines else "(no stderr)"
-            print(f"FAILED\n      {tail}")
+            try:
+                p = render_story(
+                    story, video_path, transcript_segs,
+                    out_dir, work_dir, bg_color, add_captions, input_images,
+                    max_total_duration=max_total,
+                    video_title=video_title,
+                )
+                size_mb = p.stat().st_size / 1024 / 1024
+                print(f"-> {p.name} ({size_mb:.1f} MB)")
+                output_paths.append(p)
+            except subprocess.CalledProcessError as e:
+                print(f"FAILED\n      {_stderr_tail(e)}")
 
     return output_paths
 
