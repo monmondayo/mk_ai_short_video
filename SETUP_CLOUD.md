@@ -200,21 +200,46 @@ Next.js フロントエンドからこの URL を呼び出します。
 
 ## 7. 動作テスト
 
-デプロイ後、API を直接叩いてテスト:
+デプロイ後のテスト手順:
+
+### 7-1. ローカルで動画をダウンロード → R2 にアップロード
+
+> **注意**: Modal のデータセンター IP は YouTube にブロックされるため、
+> 動画のダウンロードはローカルマシンで行い、R2 にアップロードしてから Modal に処理を依頼します。
 
 ```bash
-# Job 投入 (Phase 1: ダウンロード + 文字起こし)
+# ローカルでダウンロード＆R2アップロード
+python -m mkvideo.cloud.upload_helper test-001 "https://youtu.be/k67ewV1YU_E"
+```
+
+### 7-2. Modal に文字起こしジョブを投入
+
+```bash
+# Job 投入 (Phase 1: R2の動画を文字起こし)
 curl -X POST https://your-workspace--mkvideo-api.modal.run/submit-job \
   -H "Content-Type: application/json" \
   -d '{
     "job_id": "test-001",
-    "youtube_url": "https://youtu.be/k67ewV1YU_E",
     "whisper_model": "base",
     "whisper_language": "ja"
   }'
 
 # 返却される call_id でステータス確認
 curl https://your-workspace--mkvideo-api.modal.run/job-status/<call_id>
+```
+
+### 7-3. フロントエンドからの動画アップロード (署名URL方式)
+
+```bash
+# 1. アップロード用の署名URLを取得
+curl -X POST https://your-workspace--mkvideo-api.modal.run/upload-url \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "test-002", "filename": "video.mp4"}'
+
+# 2. 返却された upload_url に動画を PUT
+curl -X PUT "<upload_url>" \
+  -H "Content-Type: video/mp4" \
+  --data-binary @video.mp4
 ```
 
 ---
@@ -228,6 +253,7 @@ curl https://your-workspace--mkvideo-api.modal.run/job-status/<call_id>
 | R2 シークレットキーを紛失 | Cloudflare ダッシュボードでトークンを削除 → 再作成 |
 | Supabase service_role が見つからない | 「Project Settings」→「API」→ `service_role` の `Reveal` ボタン |
 | Modal デプロイが遅い | 初回は Whisper モデルのダウンロード (~1.5GB) があるため 5-10分かかる場合あり |
+| YouTube が Modal からブロックされる | **仕様**。Modal のデータセンター IP は YouTube にブロックされます。動画はローカルでダウンロードして R2 にアップロードしてください (`python -m mkvideo.cloud.upload_helper`) |
 
 ---
 
