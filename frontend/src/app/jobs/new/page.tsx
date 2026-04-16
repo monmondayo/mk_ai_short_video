@@ -6,7 +6,7 @@ import { createClient } from "@/lib/supabase-browser";
 import { getUploadUrl, submitJob } from "@/lib/modal-api";
 import Navbar from "@/components/Navbar";
 
-const DURATION_OPTIONS = ["15-30", "30-45", "30-60", "45-90", "60-120"];
+const DURATION_OPTIONS = ["0-15", "15-30", "30-45", "30-60", "45-60", "60-90"];
 
 export default function NewJobPage() {
   const router = useRouter();
