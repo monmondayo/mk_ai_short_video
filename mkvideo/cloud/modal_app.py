@@ -2,7 +2,7 @@
 Modal serverless deployment for mkvideo.
 
 Two main functions:
-  1. download_and_transcribe - Download YouTube video, run Whisper, proofread
+  1. transcribe_video_job - Run Whisper on video from R2, proofread with Claude
   2. extract_and_render - Extract stories with Claude, render all short videos
 
 Web API endpoints:
@@ -14,26 +14,31 @@ Deploy:
   modal deploy mkvideo/cloud/modal_app.py
 
 Prerequisites:
-  modal secret create mkvideo-secrets \\
-    ANTHROPIC_API_KEY=sk-ant-... \\
-    SUPABASE_URL=https://xxx.supabase.co \\
-    SUPABASE_SERVICE_KEY=eyJ... \\
-    R2_ACCOUNT_ID=... \\
-    R2_ACCESS_KEY_ID=... \\
-    R2_SECRET_ACCESS_KEY=... \\
+  modal secret create mkvideo-secrets \
+    ANTHROPIC_API_KEY=sk-ant-... \
+    SUPABASE_URL=https://xxx.supabase.co \
+    SUPABASE_SERVICE_KEY=eyJ... \
+    R2_ACCOUNT_ID=... \
+    R2_ACCESS_KEY_ID=... \
+    R2_SECRET_ACCESS_KEY=... \
     R2_BUCKET_NAME=mkvideo
+
+Note:
+  Video downloading (yt-dlp) is NOT done on Modal because datacenter IPs
+  are blocked by YouTube. Videos must be downloaded locally and uploaded
+  to R2 before submitting a job. Use cloud/upload_helper.py for this.
 """
 
 import modal
 
 # ── Container image ──────────────────────────────────────────────────
 # Installs ffmpeg, CJK fonts, and all Python dependencies.
+# Note: yt-dlp is NOT included — video download happens outside Modal.
 # Whisper model weights are cached in a persistent Volume.
 mkvideo_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg", "fonts-noto-cjk")
     .pip_install(
-        "yt-dlp>=2024.1.1",
         "openai-whisper>=20231117",
         "anthropic>=0.20.0",
         "python-dotenv>=1.0.0",
@@ -44,7 +49,17 @@ mkvideo_image = (
     )
 )
 
-app = modal.App("mkvideo", image=mkvideo_image)
+# Mount the local mkvideo package into the container at /root/mkvideo
+# so that `from mkvideo.pipeline.transcribe import ...` works.
+mkvideo_mount = modal.Mount.from_local_dir(
+    local_path="mkvideo",
+    remote_path="/root/mkvideo",
+    condition=lambda path: not any(
+        part in path for part in ["__pycache__", ".pyc", "node_modules"]
+    ),
+)
+
+app = modal.App("mkvideo", image=mkvideo_image, mounts=[mkvideo_mount])
 
 # Persistent volume for Whisper model weights (avoids re-download on cold start)
 whisper_cache = modal.Volume.from_name("mkvideo-whisper-cache", create_if_missing=True)
@@ -56,7 +71,33 @@ secrets = modal.Secret.from_name("mkvideo-secrets")
 WHISPER_CACHE_PATH = "/cache/whisper"
 
 
-# ── Job 1: Download + Transcribe ─────────────────────────────────────
+# ── Helper: download video from R2 ──────────────────────────────────
+def _download_video_from_r2(r2, job_id: str, dest_dir) -> "Path":
+    """Find and download the source video from R2 for a given job."""
+    from pathlib import Path
+
+    dest_dir = Path(dest_dir)
+    prefix_key = r2._key("source/")
+    response = r2.s3.list_objects_v2(
+        Bucket=r2.bucket_name, Prefix=prefix_key, MaxKeys=10
+    )
+    video_key = None
+    video_name = "source.mp4"
+    for obj in response.get("Contents", []):
+        key = obj["Key"]
+        if any(key.endswith(ext) for ext in (".mp4", ".mkv", ".webm", ".avi")):
+            video_key = key
+            video_name = key.rsplit("/", 1)[-1]
+            break
+    if not video_key:
+        raise RuntimeError(f"Source video not found in R2 at {prefix_key}")
+
+    video_path = dest_dir / video_name
+    r2.s3.download_file(r2.bucket_name, video_key, str(video_path))
+    return video_path
+
+
+# ── Job 1: Transcribe (video already in R2) ─────────────────────────
 @app.function(
     secrets=[secrets],
     volumes={WHISPER_CACHE_PATH: whisper_cache},
@@ -64,28 +105,27 @@ WHISPER_CACHE_PATH = "/cache/whisper"
     timeout=3600,   # 1 hour max
     memory=16384,   # 16 GB RAM
 )
-def download_and_transcribe(
+def transcribe_video_job(
     job_id: str,
-    youtube_url: str,
     whisper_model: str = "medium",
     whisper_language: str = "ja",
     skip_proofread: bool = False,
 ) -> dict:
-    """Phase 1: Download video, transcribe with Whisper, proofread with Claude.
+    """Phase 1: Download video FROM R2, transcribe with Whisper, proofread with Claude.
+
+    The video must already be uploaded to R2 at jobs/{job_id}/source/<filename>.mp4
+    (use cloud/upload_helper.py or the frontend upload to put it there).
 
     Updates job status in Supabase at each step.
-    Uploads results to R2.
     Returns dict with transcript data and R2 keys.
     """
     import os
     import tempfile
-    from pathlib import Path
 
     # Set Whisper cache dir to persistent volume
     os.environ["XDG_CACHE_HOME"] = WHISPER_CACHE_PATH
 
     from mkvideo.cloud.supabase_client import SupabaseJobClient
-    from mkvideo.pipeline.download import download_video, fetch_video_title
     from mkvideo.pipeline.transcribe import proofread_transcript, transcribe_video
     from mkvideo.storage.r2 import R2Storage
 
@@ -94,15 +134,10 @@ def download_and_transcribe(
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-
-            # Step 1: Download
+            # Step 1: Download video from R2
             db.update_job_status(job_id, "downloading")
-            video_path, video_title = download_video(youtube_url, tmp)
-
-            # Upload source video to R2
-            r2_video_key = f"source/{video_path.name}"
-            r2.save_file(video_path, r2_video_key)
+            db.update_job_progress(job_id, "downloading", 0, 1, "Downloading video from storage...")
+            video_path = _download_video_from_r2(r2, job_id, tmpdir)
             db.update_job_progress(job_id, "downloading", 1, 1, "Download complete")
 
             # Step 2: Transcribe
@@ -142,8 +177,6 @@ def download_and_transcribe(
 
             return {
                 "job_id": job_id,
-                "video_title": video_title,
-                "r2_video_key": r2_video_key,
                 "segment_count": len(transcript["segments"]),
             }
 
@@ -161,7 +194,6 @@ def download_and_transcribe(
 )
 def extract_and_render(
     job_id: str,
-    youtube_url: str,
     num_stories: int = 10,
     duration_preset: str = "30-60",
     bg_color: str = "white",
@@ -179,10 +211,8 @@ def extract_and_render(
     from mkvideo.pipeline.constants import (
         DURATION_PRESETS,
         DURATION_TOLERANCE_SEC,
-        estimate_joined_duration,
     )
     from mkvideo.pipeline.render import (
-        cleanup_render_dir,
         get_video_info,
         render_all_stories,
     )
@@ -205,22 +235,7 @@ def extract_and_render(
 
             # Download source video from R2
             db.update_job_status(job_id, "extracting")
-            r2_video_key = f"source/"
-            # Find the video file in R2
-            video_path = tmp / "source.mp4"
-            # List objects to find the video
-            prefix_key = r2._key("source/")
-            response = r2.s3.list_objects_v2(
-                Bucket=r2.bucket_name, Prefix=prefix_key, MaxKeys=10
-            )
-            video_key = None
-            for obj in response.get("Contents", []):
-                if obj["Key"].endswith(".mp4"):
-                    video_key = obj["Key"]
-                    break
-            if not video_key:
-                raise RuntimeError("Source video not found in R2")
-            r2.s3.download_file(r2.bucket_name, video_key, str(video_path))
+            video_path = _download_video_from_r2(r2, job_id, tmp)
 
             # Get transcript from Supabase
             transcript_data = db.get_transcript(job_id)
@@ -269,7 +284,7 @@ def extract_and_render(
             # TODO: Download input images from R2 if user uploaded any
             input_images = []
 
-            video_title = job.get("youtube_url", "")  # Could be improved
+            video_title = job.get("video_title", job.get("youtube_url", ""))
 
             output_paths = render_all_stories(
                 video_path, stories, transcript, out_dir,
@@ -336,7 +351,6 @@ web_app = FastAPI()
 
 class SubmitJobRequest(BaseModel):
     job_id: str
-    youtube_url: str
     whisper_model: str = "medium"
     whisper_language: str = "ja"
     skip_proofread: bool = False
@@ -344,19 +358,27 @@ class SubmitJobRequest(BaseModel):
 
 class StartRenderRequest(BaseModel):
     job_id: str
-    youtube_url: str
     num_stories: int = 10
     duration_preset: str = "30-60"
     bg_color: str = "white"
     add_captions: bool = True
 
 
+class UploadUrlRequest(BaseModel):
+    job_id: str
+    filename: str
+    content_type: str = "video/mp4"
+
+
 @web_app.post("/submit-job")
 async def submit_job(req: SubmitJobRequest):
-    """Start Phase 1: download + transcribe. Returns immediately with call_id."""
-    call = await download_and_transcribe.spawn.aio(
+    """Start Phase 1: transcribe video already in R2. Returns immediately with call_id.
+
+    The video must already be uploaded to R2 at jobs/{job_id}/source/<filename>.
+    Use POST /upload-url to get a presigned URL for uploading first.
+    """
+    call = await transcribe_video_job.spawn.aio(
         job_id=req.job_id,
-        youtube_url=req.youtube_url,
         whisper_model=req.whisper_model,
         whisper_language=req.whisper_language,
         skip_proofread=req.skip_proofread,
@@ -369,13 +391,34 @@ async def start_render(req: StartRenderRequest):
     """Start Phase 2: extract stories + render. Called after transcript review."""
     call = await extract_and_render.spawn.aio(
         job_id=req.job_id,
-        youtube_url=req.youtube_url,
         num_stories=req.num_stories,
         duration_preset=req.duration_preset,
         bg_color=req.bg_color,
         add_captions=req.add_captions,
     )
     return {"call_id": call.object_id, "job_id": req.job_id}
+
+
+@web_app.post("/upload-url")
+async def get_upload_url(req: UploadUrlRequest):
+    """Get a presigned URL for uploading a video to R2.
+
+    The frontend or CLI uploads the video directly to R2 using this URL,
+    then calls POST /submit-job to start processing.
+    """
+    import os
+    from mkvideo.storage.r2 import R2Storage
+
+    r2 = R2Storage(prefix=f"jobs/{req.job_id}")
+    upload_url = r2.generate_upload_url(
+        f"source/{req.filename}",
+        expires_in=3600,
+        content_type=req.content_type,
+    )
+    return {
+        "upload_url": upload_url,
+        "r2_key": f"jobs/{req.job_id}/source/{req.filename}",
+    }
 
 
 @web_app.get("/job-status/{call_id}")

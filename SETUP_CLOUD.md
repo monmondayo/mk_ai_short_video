@@ -66,6 +66,41 @@ SUPABASE_URL=https://abcdefg.supabase.co
 SUPABASE_SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.xxxxx
 ```
 
+### 2-3. データベーステーブル作成
+
+1. Supabase ダッシュボード → 左メニュー **「SQL Editor」**
+2. **「New Query」** をクリック
+3. `supabase/migrations/001_create_tables.sql` の内容をすべてコピー＆ペースト
+4. **「Run」** をクリック
+
+作成されるテーブル:
+
+| テーブル | 説明 |
+|---------|------|
+| `jobs` | ジョブ管理 (ステータス、進捗、パラメータ) |
+| `transcripts` | Whisper文字起こし結果 (セグメント配列、編集可能) |
+| `stories` | Claude抽出ストーリー定義 |
+| `output_videos` | 完成動画のR2リンク、尺、サイズ |
+
+セキュリティ:
+- **RLS (Row Level Security)** が全テーブルで有効 — ユーザーは自分のデータのみアクセス可能
+- Modal ワーカーは `service_role` キーで RLS をバイパス
+- **Realtime** が `jobs` テーブルで有効 — フロントエンドが `progress` の変更をリアルタイム受信
+
+### 2-4. Realtime の有効化確認
+
+1. ダッシュボード → **「Database」** → **「Replication」**
+2. `supabase_realtime` の Source で `jobs` テーブルにチェックが入っていることを確認
+3. 入っていなければチェックを入れて保存
+
+### 2-5. Authentication 設定
+
+1. ダッシュボード → **「Authentication」** → **「Providers」**
+2. **Email** が有効になっていることを確認 (デフォルトで有効)
+3. 必要に応じて **Google** / **GitHub** OAuth も有効化:
+   - Google: GCP Console で OAuth クライアント ID を作成、Supabase に登録
+   - GitHub: GitHub Settings → Developer settings → OAuth Apps
+
 ---
 
 ## 3. Cloudflare R2 (R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME)
@@ -119,6 +154,57 @@ R2_BUCKET_NAME=mkvideo
 R2_ACCESS_KEY_ID=xxxxxxxxxxxxxxxxx
 R2_SECRET_ACCESS_KEY=yyyyyyyyyyyyyyyyyyyy
 ```
+
+### 3-5. CORS 設定 (フロントエンドからの直接アップロードに必要)
+
+フロントエンドからブラウザ経由で R2 に動画をアップロードするため、CORS (Cross-Origin Resource Sharing) を設定する必要があります。
+
+**方法 A: Cloudflare ダッシュボードから設定**
+
+1. **R2 オブジェクトストレージ** → バケット `mkvideo` をクリック
+2. **「設定」** タブをクリック
+3. **「CORS ポリシー」** セクションで **「編集」** をクリック
+4. 以下の JSON を貼り付けて **「保存」**:
+
+```json
+[
+  {
+    "AllowedOrigins": [
+      "http://localhost:3000",
+      "https://*.vercel.app"
+    ],
+    "AllowedMethods": ["GET", "PUT", "HEAD"],
+    "AllowedHeaders": ["Content-Type", "Content-Length"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+> **本番ドメイン追加**: Vercel にカスタムドメインを設定した場合、`AllowedOrigins` にそのドメインも追加してください。
+> 例: `"https://mkvideo.yourdomain.com"`
+
+**方法 B: AWS CLI (S3互換) から設定**
+
+```bash
+# AWS CLI を S3互換モードで R2 に接続
+aws s3api put-bucket-cors \
+  --bucket mkvideo \
+  --cors-configuration file://cloudflare/r2-cors.json \
+  --endpoint-url https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com
+```
+
+### 3-6. CORS 設定確認
+
+```bash
+# preflight リクエストをシミュレート
+curl -I -X OPTIONS \
+  -H "Origin: http://localhost:3000" \
+  -H "Access-Control-Request-Method: PUT" \
+  "https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com/mkvideo/test"
+```
+
+レスポンスに `Access-Control-Allow-Origin: http://localhost:3000` が含まれていれば成功です。
 
 ---
 
@@ -180,6 +266,8 @@ modal secret list
 
 ## 6. デプロイ
 
+### 6-1. Modal デプロイ (バックエンド)
+
 ```bash
 # プロジェクトルートから実行
 modal deploy mkvideo/cloud/modal_app.py
@@ -188,33 +276,116 @@ modal deploy mkvideo/cloud/modal_app.py
 成功すると以下のように表示されます:
 ```
 ✓ Created objects.
-├── 🔨 Created download_and_transcribe.
+├── 🔨 Created transcribe_video_job.
 ├── 🔨 Created extract_and_render.
 └── 🔨 Created api => https://your-workspace--mkvideo-api.modal.run
 ```
 
-表示される URL が Web API のエンドポイントです。
-Next.js フロントエンドからこの URL を呼び出します。
+表示される URL (`https://your-workspace--mkvideo-api.modal.run`) をメモしてください。
+
+### 6-2. Vercel デプロイ (フロントエンド)
+
+**方法 A: Vercel CLI (推奨)**
+
+```bash
+# Vercel CLI インストール
+npm install -g vercel
+
+# frontend ディレクトリからデプロイ
+cd frontend
+vercel
+```
+
+初回は対話式でプロジェクト設定が求められます:
+- **Link to existing project?** → No (新規)
+- **Project name** → `mkvideo`
+- **Framework** → Next.js (自動検出)
+- **Root Directory** → `./` (frontend ディレクトリ内で実行しているため)
+
+**方法 B: GitHub 連携 (自動デプロイ)**
+
+1. https://vercel.com/ にログイン
+2. **「Add New」** → **「Project」** → GitHub リポジトリを選択
+3. **Root Directory** を `frontend` に設定
+4. **「Deploy」** をクリック
+
+### 6-3. Vercel 環境変数の設定
+
+Vercel ダッシュボード → プロジェクト → **「Settings」** → **「Environment Variables」** で以下を追加:
+
+| 変数名 | 値 | 例 |
+|--------|-----|-----|
+| `NEXT_PUBLIC_SUPABASE_URL` | Supabase プロジェクト URL | `https://abcdefg.supabase.co` |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase の **anon** キー (※ service_role ではない) | `eyJhbGci...` |
+| `NEXT_PUBLIC_MODAL_API_URL` | Modal の API URL (6-1 で取得) | `https://xxx--mkvideo-api.modal.run` |
+
+> **Supabase anon key の場所**: Supabase ダッシュボード → Project Settings → API → `anon` の `public` キー
+
+設定後、**「Redeploy」** を実行してください。
+
+### 6-4. ローカル開発用 .env.local
+
+```bash
+cd frontend
+cp .env.local.example .env.local
+```
+
+`.env.local` を編集:
+```
+NEXT_PUBLIC_SUPABASE_URL=https://abcdefg.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGci...
+NEXT_PUBLIC_MODAL_API_URL=https://xxx--mkvideo-api.modal.run
+```
+
+```bash
+npm run dev
+# → http://localhost:3000
+```
 
 ---
 
 ## 7. 動作テスト
 
-デプロイ後、API を直接叩いてテスト:
+デプロイ後のテスト手順:
+
+### 7-1. ローカルで動画をダウンロード → R2 にアップロード
+
+> **注意**: Modal のデータセンター IP は YouTube にブロックされるため、
+> 動画のダウンロードはローカルマシンで行い、R2 にアップロードしてから Modal に処理を依頼します。
 
 ```bash
-# Job 投入 (Phase 1: ダウンロード + 文字起こし)
+# ローカルでダウンロード＆R2アップロード
+python -m mkvideo.cloud.upload_helper test-001 "https://youtu.be/k67ewV1YU_E"
+```
+
+### 7-2. Modal に文字起こしジョブを投入
+
+```bash
+# Job 投入 (Phase 1: R2の動画を文字起こし)
 curl -X POST https://your-workspace--mkvideo-api.modal.run/submit-job \
   -H "Content-Type: application/json" \
   -d '{
     "job_id": "test-001",
-    "youtube_url": "https://youtu.be/k67ewV1YU_E",
     "whisper_model": "base",
     "whisper_language": "ja"
   }'
 
 # 返却される call_id でステータス確認
 curl https://your-workspace--mkvideo-api.modal.run/job-status/<call_id>
+```
+
+### 7-3. フロントエンドからの動画アップロード (署名URL方式)
+
+```bash
+# 1. アップロード用の署名URLを取得
+curl -X POST https://your-workspace--mkvideo-api.modal.run/upload-url \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "test-002", "filename": "video.mp4"}'
+
+# 2. 返却された upload_url に動画を PUT
+curl -X PUT "<upload_url>" \
+  -H "Content-Type: video/mp4" \
+  --data-binary @video.mp4
 ```
 
 ---
@@ -228,6 +399,7 @@ curl https://your-workspace--mkvideo-api.modal.run/job-status/<call_id>
 | R2 シークレットキーを紛失 | Cloudflare ダッシュボードでトークンを削除 → 再作成 |
 | Supabase service_role が見つからない | 「Project Settings」→「API」→ `service_role` の `Reveal` ボタン |
 | Modal デプロイが遅い | 初回は Whisper モデルのダウンロード (~1.5GB) があるため 5-10分かかる場合あり |
+| YouTube が Modal からブロックされる | **仕様**。Modal のデータセンター IP は YouTube にブロックされます。動画はローカルでダウンロードして R2 にアップロードしてください (`python -m mkvideo.cloud.upload_helper`) |
 
 ---
 
