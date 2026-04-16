@@ -3,9 +3,31 @@
 ## 全体構成
 
 ```
-Frontend (Vercel)  →  Modal (処理)  →  Cloudflare R2 (ファイル保存)
-                   →  Supabase (DB + Auth + リアルタイム通知)
+                   ┌──────────────────────────────────┐
+                   │     Frontend (Vercel / Next.js)   │
+                   └──┬──────────┬──────────┬──────────┘
+                      │          │          │
+              動画アップロード  API呼び出し  リアルタイム通知
+              (署名URL経由)     │          │
+                      │          │          │
+                      ▼          ▼          ▼
+              Cloudflare R2   Modal     Supabase
+              (ファイル保存)  (処理)   (DB + Auth)
+                      ▲          │          ▲
+                      │          │          │
+                      └──────────┴──────────┘
+                       読み書き     ステータス更新
 ```
+
+**処理フロー:**
+1. ユーザーが動画をブラウザからアップロード → R2 に直接保存 (署名URL)
+2. Modal が R2 から動画を取得 → Whisper 文字起こし → Claude 校正
+3. ユーザーがフロントエンドでトランスクリプトを編集
+4. Modal が Claude でストーリー抽出 → ffmpeg でショート動画をレンダリング → R2 に保存
+5. フロントエンドで完成動画をダウンロード
+
+> **YouTube動画の場合**: ModalのIPはYouTubeにブロックされるため、
+> ローカルで `yt-dlp` ダウンロード → R2 アップロード → Modal 処理 の流れになります。
 
 必要なアカウント: **Modal**, **Supabase**, **Cloudflare**, **Anthropic**
 
@@ -70,8 +92,12 @@ SUPABASE_SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.xxxxx
 
 1. Supabase ダッシュボード → 左メニュー **「SQL Editor」**
 2. **「New Query」** をクリック
-3. `supabase/migrations/001_create_tables.sql` の内容をすべてコピー＆ペースト
-4. **「Run」** をクリック
+3. `supabase/migrations/002_drop_and_recreate.sql` の内容をすべてコピー＆ペースト
+4. **「Run」** をクリック → 「Success. No rows returned」と表示されれば成功
+
+> **初回セットアップの場合**: `002_drop_and_recreate.sql` を使ってください。
+> これは既存テーブルがあれば DROP してから作り直すため、初回でも再セットアップでも安全に使えます。
+> `001_create_tables.sql` は参考用です。
 
 作成されるテーブル:
 
@@ -344,21 +370,43 @@ npm run dev
 
 ---
 
-## 7. 動作テスト
+## 7. セットアップ検証
+
+デプロイ前に、設定が正しいか検証スクリプトで確認できます:
+
+```bash
+# プロジェクトルートで実行 (mkvideo conda 環境)
+PYTHONPATH=. python scripts/verify_setup.py
+```
+
+環境変数、Supabase接続、R2バケットアクセス、パッケージ import、ffmpeg をチェックします。
+全項目が `PASS` になればデプロイ準備完了です。
+
+---
+
+## 8. 動作テスト
 
 デプロイ後のテスト手順:
 
-### 7-1. ローカルで動画をダウンロード → R2 にアップロード
+### 8-1. ローカルで動画をダウンロード → R2 にアップロード
 
 > **注意**: Modal のデータセンター IP は YouTube にブロックされるため、
 > 動画のダウンロードはローカルマシンで行い、R2 にアップロードしてから Modal に処理を依頼します。
 
 ```bash
-# ローカルでダウンロード＆R2アップロード
-python -m mkvideo.cloud.upload_helper test-001 "https://youtu.be/k67ewV1YU_E"
+# .env に R2 の認証情報が設定されていることを確認してから実行
+PYTHONPATH=. python -m mkvideo.cloud.upload_helper test-001 "https://youtu.be/k67ewV1YU_E"
 ```
 
-### 7-2. Modal に文字起こしジョブを投入
+出力例:
+```
+[Upload] Downloading video from YouTube...
+[Upload] Downloaded: video.mp4 (150.3 MB)
+[Upload] Uploading to R2 (jobs/test-001/source/video.mp4)...
+[Upload] Upload complete: jobs/test-001/source/video.mp4
+```
+
+### 8-2. Modal に文字起こしジョブを投入
 
 ```bash
 # Job 投入 (Phase 1: R2の動画を文字起こし)
@@ -374,7 +422,7 @@ curl -X POST https://your-workspace--mkvideo-api.modal.run/submit-job \
 curl https://your-workspace--mkvideo-api.modal.run/job-status/<call_id>
 ```
 
-### 7-3. フロントエンドからの動画アップロード (署名URL方式)
+### 8-3. フロントエンドからの動画アップロード (署名URL方式)
 
 ```bash
 # 1. アップロード用の署名URLを取得
@@ -388,6 +436,16 @@ curl -X PUT "<upload_url>" \
   --data-binary @video.mp4
 ```
 
+### 8-4. フロントエンド (ブラウザ) からの E2E テスト
+
+1. `http://localhost:3000` (ローカル) or Vercel URL にアクセス
+2. メールアドレスで **Sign Up** → 確認メール → ログイン
+3. **「+ New Job」** をクリック
+4. 動画ファイルを選択してアップロード → パラメータ設定 → **「Create Short Videos」**
+5. ジョブ詳細画面で進捗がリアルタイム表示される
+6. `awaiting_review` になったらトランスクリプトを編集 → **「Save & Continue」**
+7. レンダリング完了後、完成動画が一覧表示される
+
 ---
 
 ## トラブルシューティング
@@ -398,17 +456,38 @@ curl -X PUT "<upload_url>" \
 | シークレット値を間違えた | `modal secret create mkvideo-secrets KEY=NEW_VALUE` で上書き |
 | R2 シークレットキーを紛失 | Cloudflare ダッシュボードでトークンを削除 → 再作成 |
 | Supabase service_role が見つからない | 「Project Settings」→「API」→ `service_role` の `Reveal` ボタン |
+| Supabase anon key が見つからない | 「Project Settings」→「API」→ `anon` の `public` キー (フロントエンド用) |
 | Modal デプロイが遅い | 初回は Whisper モデルのダウンロード (~1.5GB) があるため 5-10分かかる場合あり |
-| YouTube が Modal からブロックされる | **仕様**。Modal のデータセンター IP は YouTube にブロックされます。動画はローカルでダウンロードして R2 にアップロードしてください (`python -m mkvideo.cloud.upload_helper`) |
+| YouTube が Modal からブロックされる | **仕様**。動画はローカルでダウンロードして R2 にアップロードしてください (`python -m mkvideo.cloud.upload_helper`) |
+| Modal で `ModuleNotFoundError: mkvideo` | `modal deploy` をプロジェクトルートから実行しているか確認。`modal.Mount` がローカルの `mkvideo/` をマウントします |
+| フロントエンドから R2 アップロードが CORS エラー | セクション 3-5 の CORS 設定を確認。`AllowedOrigins` にフロントエンドの URL が含まれているか確認 |
+| Supabase の SQL が `column "user_id" does not exist` | `002_drop_and_recreate.sql` を使ってください (001 ではなく) |
+| Realtime で進捗が更新されない | Supabase ダッシュボード → Database → Replication で `jobs` テーブルが有効か確認 |
+| `verify_setup.py` で環境変数が FAIL | プロジェクトルートの `.env` に各キーが設定されているか確認 |
 
 ---
 
 ## 費用見積もり (月 5-10本の動画処理)
 
-| サービス | 月額 |
-|---------|------|
-| Modal ($30 無料枠内) | $0 |
-| Supabase (無料枠) | $0 |
-| Cloudflare R2 (無料枠) | $0 |
-| Anthropic API | ~$2-5 |
-| **合計** | **~$2-5** |
+| サービス | 無料枠 | 月額 |
+|---------|--------|------|
+| Modal | $30/月 | $0 (無料枠内) |
+| Supabase | 500MB DB, 50K MAU | $0 (無料枠内) |
+| Cloudflare R2 | 10GB, 転送料無料 | $0 (無料枠内) |
+| Vercel | 100GB帯域 | $0 (Hobby プラン) |
+| Anthropic API | なし (従量課金) | ~$2-5 |
+| **合計** | | **~$2-5/月** |
+
+---
+
+## ローカル CLI も引き続き使えます
+
+クラウドデプロイしても、ローカル CLI は今まで通り動作します:
+
+```bash
+# mkvideo conda 環境で実行
+./run.sh "https://youtu.be/xxxxx" -n 5 --duration 30-45 --output-dir output
+
+# オプション一覧
+./run.sh --help
+```
