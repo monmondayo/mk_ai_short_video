@@ -47,19 +47,12 @@ mkvideo_image = (
         "boto3>=1.34.0",
         "requests>=2.31.0",
     )
+    # Copy local mkvideo package into the container image
+    # so that `from mkvideo.pipeline.transcribe import ...` works.
+    .add_local_dir("mkvideo", remote_path="/root/mkvideo")
 )
 
-# Mount the local mkvideo package into the container at /root/mkvideo
-# so that `from mkvideo.pipeline.transcribe import ...` works.
-mkvideo_mount = modal.Mount.from_local_dir(
-    local_path="mkvideo",
-    remote_path="/root/mkvideo",
-    condition=lambda path: not any(
-        part in path for part in ["__pycache__", ".pyc", "node_modules"]
-    ),
-)
-
-app = modal.App("mkvideo", image=mkvideo_image, mounts=[mkvideo_mount])
+app = modal.App("mkvideo", image=mkvideo_image)
 
 # Persistent volume for Whisper model weights (avoids re-download on cold start)
 whisper_cache = modal.Volume.from_name("mkvideo-whisper-cache", create_if_missing=True)
