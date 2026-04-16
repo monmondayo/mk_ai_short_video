@@ -155,6 +155,57 @@ R2_ACCESS_KEY_ID=xxxxxxxxxxxxxxxxx
 R2_SECRET_ACCESS_KEY=yyyyyyyyyyyyyyyyyyyy
 ```
 
+### 3-5. CORS 設定 (フロントエンドからの直接アップロードに必要)
+
+フロントエンドからブラウザ経由で R2 に動画をアップロードするため、CORS (Cross-Origin Resource Sharing) を設定する必要があります。
+
+**方法 A: Cloudflare ダッシュボードから設定**
+
+1. **R2 オブジェクトストレージ** → バケット `mkvideo` をクリック
+2. **「設定」** タブをクリック
+3. **「CORS ポリシー」** セクションで **「編集」** をクリック
+4. 以下の JSON を貼り付けて **「保存」**:
+
+```json
+[
+  {
+    "AllowedOrigins": [
+      "http://localhost:3000",
+      "https://*.vercel.app"
+    ],
+    "AllowedMethods": ["GET", "PUT", "HEAD"],
+    "AllowedHeaders": ["Content-Type", "Content-Length"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+> **本番ドメイン追加**: Vercel にカスタムドメインを設定した場合、`AllowedOrigins` にそのドメインも追加してください。
+> 例: `"https://mkvideo.yourdomain.com"`
+
+**方法 B: AWS CLI (S3互換) から設定**
+
+```bash
+# AWS CLI を S3互換モードで R2 に接続
+aws s3api put-bucket-cors \
+  --bucket mkvideo \
+  --cors-configuration file://cloudflare/r2-cors.json \
+  --endpoint-url https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com
+```
+
+### 3-6. CORS 設定確認
+
+```bash
+# preflight リクエストをシミュレート
+curl -I -X OPTIONS \
+  -H "Origin: http://localhost:3000" \
+  -H "Access-Control-Request-Method: PUT" \
+  "https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com/mkvideo/test"
+```
+
+レスポンスに `Access-Control-Allow-Origin: http://localhost:3000` が含まれていれば成功です。
+
 ---
 
 ## 4. Modal (サーバーレス実行環境)
@@ -215,6 +266,8 @@ modal secret list
 
 ## 6. デプロイ
 
+### 6-1. Modal デプロイ (バックエンド)
+
 ```bash
 # プロジェクトルートから実行
 modal deploy mkvideo/cloud/modal_app.py
@@ -223,13 +276,71 @@ modal deploy mkvideo/cloud/modal_app.py
 成功すると以下のように表示されます:
 ```
 ✓ Created objects.
-├── 🔨 Created download_and_transcribe.
+├── 🔨 Created transcribe_video_job.
 ├── 🔨 Created extract_and_render.
 └── 🔨 Created api => https://your-workspace--mkvideo-api.modal.run
 ```
 
-表示される URL が Web API のエンドポイントです。
-Next.js フロントエンドからこの URL を呼び出します。
+表示される URL (`https://your-workspace--mkvideo-api.modal.run`) をメモしてください。
+
+### 6-2. Vercel デプロイ (フロントエンド)
+
+**方法 A: Vercel CLI (推奨)**
+
+```bash
+# Vercel CLI インストール
+npm install -g vercel
+
+# frontend ディレクトリからデプロイ
+cd frontend
+vercel
+```
+
+初回は対話式でプロジェクト設定が求められます:
+- **Link to existing project?** → No (新規)
+- **Project name** → `mkvideo`
+- **Framework** → Next.js (自動検出)
+- **Root Directory** → `./` (frontend ディレクトリ内で実行しているため)
+
+**方法 B: GitHub 連携 (自動デプロイ)**
+
+1. https://vercel.com/ にログイン
+2. **「Add New」** → **「Project」** → GitHub リポジトリを選択
+3. **Root Directory** を `frontend` に設定
+4. **「Deploy」** をクリック
+
+### 6-3. Vercel 環境変数の設定
+
+Vercel ダッシュボード → プロジェクト → **「Settings」** → **「Environment Variables」** で以下を追加:
+
+| 変数名 | 値 | 例 |
+|--------|-----|-----|
+| `NEXT_PUBLIC_SUPABASE_URL` | Supabase プロジェクト URL | `https://abcdefg.supabase.co` |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase の **anon** キー (※ service_role ではない) | `eyJhbGci...` |
+| `NEXT_PUBLIC_MODAL_API_URL` | Modal の API URL (6-1 で取得) | `https://xxx--mkvideo-api.modal.run` |
+
+> **Supabase anon key の場所**: Supabase ダッシュボード → Project Settings → API → `anon` の `public` キー
+
+設定後、**「Redeploy」** を実行してください。
+
+### 6-4. ローカル開発用 .env.local
+
+```bash
+cd frontend
+cp .env.local.example .env.local
+```
+
+`.env.local` を編集:
+```
+NEXT_PUBLIC_SUPABASE_URL=https://abcdefg.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGci...
+NEXT_PUBLIC_MODAL_API_URL=https://xxx--mkvideo-api.modal.run
+```
+
+```bash
+npm run dev
+# → http://localhost:3000
+```
 
 ---
 
