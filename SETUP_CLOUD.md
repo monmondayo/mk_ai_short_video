@@ -66,6 +66,41 @@ SUPABASE_URL=https://abcdefg.supabase.co
 SUPABASE_SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.xxxxx
 ```
 
+### 2-3. データベーステーブル作成
+
+1. Supabase ダッシュボード → 左メニュー **「SQL Editor」**
+2. **「New Query」** をクリック
+3. `supabase/migrations/001_create_tables.sql` の内容をすべてコピー＆ペースト
+4. **「Run」** をクリック
+
+作成されるテーブル:
+
+| テーブル | 説明 |
+|---------|------|
+| `jobs` | ジョブ管理 (ステータス、進捗、パラメータ) |
+| `transcripts` | Whisper文字起こし結果 (セグメント配列、編集可能) |
+| `stories` | Claude抽出ストーリー定義 |
+| `output_videos` | 完成動画のR2リンク、尺、サイズ |
+
+セキュリティ:
+- **RLS (Row Level Security)** が全テーブルで有効 — ユーザーは自分のデータのみアクセス可能
+- Modal ワーカーは `service_role` キーで RLS をバイパス
+- **Realtime** が `jobs` テーブルで有効 — フロントエンドが `progress` の変更をリアルタイム受信
+
+### 2-4. Realtime の有効化確認
+
+1. ダッシュボード → **「Database」** → **「Replication」**
+2. `supabase_realtime` の Source で `jobs` テーブルにチェックが入っていることを確認
+3. 入っていなければチェックを入れて保存
+
+### 2-5. Authentication 設定
+
+1. ダッシュボード → **「Authentication」** → **「Providers」**
+2. **Email** が有効になっていることを確認 (デフォルトで有効)
+3. 必要に応じて **Google** / **GitHub** OAuth も有効化:
+   - Google: GCP Console で OAuth クライアント ID を作成、Supabase に登録
+   - GitHub: GitHub Settings → Developer settings → OAuth Apps
+
 ---
 
 ## 3. Cloudflare R2 (R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME)

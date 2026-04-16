@@ -52,6 +52,46 @@ class SupabaseJobClient:
         resp.raise_for_status()
         return resp.json()
 
+    def _get(self, table: str, match: dict, select: str = "*") -> list[dict]:
+        """Select rows matching the given filters."""
+        url = self._rest_url(table)
+        params = {f"{k}": f"eq.{v}" for k, v in match.items()}
+        params["select"] = select
+        resp = requests.get(url, headers=self.headers, params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ── Job creation ─────────────────────────────────────────────────
+
+    def create_job(
+        self,
+        user_id: str,
+        youtube_url: str,
+        video_title: str = "",
+        whisper_model: str = "medium",
+        whisper_language: str = "ja",
+        num_stories: int = 10,
+        duration_preset: str = "30-60",
+        bg_color: str = "white",
+        add_captions: bool = True,
+        skip_proofread: bool = False,
+    ) -> dict:
+        """Create a new job and return the row (including generated UUID)."""
+        data = {
+            "user_id": user_id,
+            "youtube_url": youtube_url,
+            "video_title": video_title,
+            "whisper_model": whisper_model,
+            "whisper_language": whisper_language,
+            "num_stories": num_stories,
+            "duration_preset": duration_preset,
+            "bg_color": bg_color,
+            "add_captions": add_captions,
+            "skip_proofread": skip_proofread,
+        }
+        rows = self._post("jobs", data)
+        return rows[0] if isinstance(rows, list) and rows else rows
+
     # ── Job status updates ────────────────────────────────────────────
 
     def update_job_status(
