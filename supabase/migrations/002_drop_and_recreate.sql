@@ -43,6 +43,9 @@ create table public.jobs (
                       'transcribing',
                       'proofreading',
                       'awaiting_review',
+                      'awaiting_story_review',
+                      'preparing_subtitles',
+                      'awaiting_subtitle_review',
                       'extracting',
                       'rendering',
                       'complete',
@@ -93,6 +96,9 @@ create table public.stories (
     id              uuid primary key default uuid_generate_v4(),
     job_id          uuid not null references public.jobs(id) on delete cascade,
     stories_json    jsonb not null default '[]',
+    -- subtitles_json is populated only when the user opted into
+    -- --review-subtitles style pause before rendering.
+    subtitles_json  jsonb default null,
     created_at      timestamptz default now(),
     updated_at      timestamptz default now(),
     unique(job_id)

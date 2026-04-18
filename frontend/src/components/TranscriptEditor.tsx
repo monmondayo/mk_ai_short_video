@@ -22,12 +22,16 @@ export default function TranscriptEditor({
 }: {
   jobId: string;
   segments: Segment[];
-  onSave?: () => void;
+  /** Called after the transcript is persisted. Returning a Promise lets us
+   *  keep the button disabled until the parent finishes its work. */
+  onSave?: () => void | Promise<void>;
 }) {
   const supabase = createClient();
   const [segments, setSegments] = useState(initialSegments);
   const [saving, setSaving] = useState(false);
+  const [continuing, setContinuing] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const updateSegmentText = (index: number, text: string) => {
     const updated = [...segments];
@@ -36,20 +40,49 @@ export default function TranscriptEditor({
     setSaved(false);
   };
 
-  const handleSave = async () => {
-    setSaving(true);
+  const persistTranscript = async (): Promise<boolean> => {
     const { error } = await supabase
       .from("transcripts")
       .update({ segments })
       .eq("job_id", jobId);
-
     if (error) {
-      alert(`Save failed: ${error.message}`);
-    } else {
-      setSaved(true);
+      setErrorMsg(`Save failed: ${error.message}`);
+      return false;
     }
+    return true;
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setErrorMsg(null);
+    const ok = await persistTranscript();
+    if (ok) setSaved(true);
     setSaving(false);
   };
+
+  const handleSaveAndContinue = async () => {
+    if (!onSave) return;
+    setContinuing(true);
+    setErrorMsg(null);
+    try {
+      const ok = await persistTranscript();
+      if (!ok) {
+        setContinuing(false);
+        return;
+      }
+      setSaved(true);
+      await onSave();
+      // Keep `continuing` true — parent is about to router.refresh() and
+      // this component will unmount when status leaves awaiting_review.
+    } catch (e) {
+      setErrorMsg(
+        e instanceof Error ? e.message : "Failed to start render",
+      );
+      setContinuing(false);
+    }
+  };
+
+  const busy = saving || continuing;
 
   return (
     <div className="space-y-3">
@@ -58,26 +91,36 @@ export default function TranscriptEditor({
           Transcript Editor
         </h2>
         <div className="flex items-center gap-3">
-          {saved && (
+          {saved && !continuing && (
             <span className="text-sm text-green-600">Saved</span>
           )}
           <button
             onClick={handleSave}
-            disabled={saving}
-            className="px-4 py-1.5 bg-gray-900 text-white rounded-lg text-sm font-medium hover:bg-gray-800 disabled:opacity-50"
+            disabled={busy}
+            className="px-4 py-1.5 bg-gray-900 text-white rounded-lg text-sm font-medium hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {saving ? "Saving..." : "Save"}
           </button>
           {onSave && (
             <button
-              onClick={onSave}
-              className="px-4 py-1.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700"
+              onClick={handleSaveAndContinue}
+              disabled={busy}
+              className="px-4 py-1.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-2"
             >
-              Save & Continue
+              {continuing && (
+                <span className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+              )}
+              {continuing ? "Starting render..." : "Save & Continue"}
             </button>
           )}
         </div>
       </div>
+
+      {errorMsg && (
+        <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-sm text-red-700">
+          {errorMsg}
+        </div>
+      )}
 
       <p className="text-sm text-gray-500">
         Edit the transcript below. Each row is a timed segment. Fix any

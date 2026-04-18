@@ -18,16 +18,19 @@ create table if not exists public.jobs (
     video_title   text default '',
     status        text not null default 'pending'
                   check (status in (
-                      'pending',           -- job created, waiting for video upload
-                      'uploading',         -- video being uploaded to R2
-                      'downloading',       -- (legacy) downloading from R2
-                      'transcribing',      -- Whisper running
-                      'proofreading',      -- Claude proofreading transcript
-                      'awaiting_review',   -- transcript ready, waiting for user
-                      'extracting',        -- Claude extracting stories
-                      'rendering',         -- ffmpeg rendering shorts
-                      'complete',          -- all done
-                      'failed'             -- error occurred
+                      'pending',                -- job created, waiting for video upload
+                      'uploading',              -- video being uploaded to R2
+                      'downloading',            -- (legacy) downloading from R2
+                      'transcribing',           -- Whisper running
+                      'proofreading',           -- Claude proofreading transcript
+                      'awaiting_review',        -- transcript ready, waiting for user
+                      'awaiting_story_review',  -- stories extracted, waiting for user
+                      'preparing_subtitles',    -- cutting + joining + generating SRT
+                      'awaiting_subtitle_review', -- SRTs ready, waiting for user
+                      'extracting',             -- Claude extracting stories
+                      'rendering',              -- ffmpeg rendering shorts
+                      'complete',               -- all done
+                      'failed'                  -- error occurred
                   )),
     progress      jsonb default '{}',
     -- progress schema: { "step": "transcribing", "current": 2, "total": 10, "detail": "..." }
@@ -92,6 +95,12 @@ create table if not exists public.stories (
     -- stories_json schema: [{ "rank": 1, "title": "...", "hook_text": "...",
     --   "segments": [{ "start": 10.5, "end": 25.0, "transition_in": "dissolve" }],
     --   ... }, ...]
+
+    subtitles_json  jsonb default null,
+    -- subtitles_json schema (present only when the user opted into
+    -- subtitle review, mirroring the CLI's --review-subtitles flag):
+    --   { "<rank>": { "srt": "...", "durations": [..],
+    --                 "joined_key": "joined/s<rank>.mp4" }, ... }
 
     created_at      timestamptz default now(),
     updated_at      timestamptz default now(),

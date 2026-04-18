@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase-browser";
 import { getUploadUrl, submitJob } from "@/lib/modal-api";
@@ -14,6 +14,29 @@ export default function NewJobPage() {
 
   const [url, setUrl] = useState("");
   const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [imageFiles, setImageFiles] = useState<File[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+
+  // Accept only image files, merge with existing selection, dedupe by name+size
+  const IMAGE_EXTS = ["jpg", "jpeg", "png", "webp", "bmp"];
+  const addImages = (incoming: FileList | File[]) => {
+    const next = Array.from(incoming).filter((f) => {
+      if (f.type.startsWith("image/")) return true;
+      const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
+      return IMAGE_EXTS.includes(ext);
+    });
+    setImageFiles((prev) => {
+      const map = new Map<string, File>();
+      for (const f of [...prev, ...next]) {
+        map.set(`${f.name}:${f.size}`, f);
+      }
+      return Array.from(map.values());
+    });
+  };
+  const removeImage = (index: number) => {
+    setImageFiles((prev) => prev.filter((_, i) => i !== index));
+  };
   const [numStories, setNumStories] = useState(10);
   const [duration, setDuration] = useState("30-60");
   const [whisperModel, setWhisperModel] = useState("medium");
@@ -34,6 +57,11 @@ export default function NewJobPage() {
     setLoading(true);
     setError("");
 
+    // Track the job ID so we can mark it failed if any post-insert step
+    // throws. Without this, a network hiccup during upload leaves the
+    // job stuck at "uploading" forever.
+    let createdJobId: string | null = null;
+
     try {
       // 1. Get current user
       const {
@@ -41,14 +69,21 @@ export default function NewJobPage() {
       } = await supabase.auth.getUser();
       if (!user) throw new Error("Not authenticated");
 
-      // 2. Create job in Supabase
+      // 2. Create job in Supabase.
+      // Strip the file extension from the title so it isn't rendered as
+      // "video.mp4" on the shorts. We only strip common video extensions
+      // to avoid mangling titles that legitimately contain dots.
+      const titleFromFile = videoFile.name.replace(
+        /\.(mp4|mkv|mov|webm|avi|m4v|flv|wmv)$/i,
+        "",
+      );
       setStatus("Creating job...");
       const { data: job, error: jobError } = await supabase
         .from("jobs")
         .insert({
           user_id: user.id,
           youtube_url: url || "(uploaded file)",
-          video_title: videoFile.name,
+          video_title: titleFromFile,
           whisper_model: whisperModel,
           whisper_language: whisperLang,
           num_stories: numStories,
@@ -62,6 +97,7 @@ export default function NewJobPage() {
         .single();
 
       if (jobError) throw new Error(jobError.message);
+      createdJobId = job.id;
 
       // 3. Get presigned upload URL from Modal
       setStatus("Getting upload URL...");
@@ -79,6 +115,24 @@ export default function NewJobPage() {
         body: videoFile,
       });
       if (!uploadRes.ok) throw new Error("Video upload failed");
+
+      // 4b. Upload overlay images (optional)
+      for (let i = 0; i < imageFiles.length; i++) {
+        const img = imageFiles[i];
+        setStatus(`Uploading image ${i + 1}/${imageFiles.length}: ${img.name}`);
+        const { upload_url: imgUrl } = await getUploadUrl({
+          job_id: job.id,
+          filename: img.name,
+          content_type: img.type || "image/jpeg",
+          path_prefix: "input",
+        });
+        const imgRes = await fetch(imgUrl, {
+          method: "PUT",
+          headers: { "Content-Type": img.type || "image/jpeg" },
+          body: img,
+        });
+        if (!imgRes.ok) throw new Error(`Image upload failed: ${img.name}`);
+      }
 
       // 5. Submit transcription job to Modal
       setStatus("Starting transcription...");
@@ -98,8 +152,23 @@ export default function NewJobPage() {
       // Navigate to job detail page
       router.push(`/jobs/${job.id}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error");
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      setError(msg);
       setLoading(false);
+
+      // If the row was already inserted, flag it as failed so it doesn't
+      // sit at "uploading" forever on the dashboard. Best-effort — we
+      // swallow errors here so the original failure surfaces to the user.
+      if (createdJobId) {
+        try {
+          await supabase
+            .from("jobs")
+            .update({ status: "failed", error_message: msg })
+            .eq("id", createdJobId);
+        } catch (markErr) {
+          console.warn("Failed to mark job as failed:", markErr);
+        }
+      }
     }
   };
 
@@ -144,6 +213,106 @@ export default function NewJobPage() {
               <p className="text-xs text-gray-500 mt-1">
                 {videoFile.name} ({(videoFile.size / 1024 / 1024).toFixed(1)} MB)
               </p>
+            )}
+          </div>
+
+          {/* Overlay Images (optional) */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Overlay Images (optional)
+            </label>
+            <div
+              onClick={() => imageInputRef.current?.click()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  imageInputRef.current?.click();
+                }
+              }}
+              role="button"
+              tabIndex={0}
+              onDragEnter={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsDragging(true);
+              }}
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (!isDragging) setIsDragging(true);
+              }}
+              onDragLeave={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                // Only hide when leaving the dropzone itself, not a child
+                if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+                setIsDragging(false);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsDragging(false);
+                if (e.dataTransfer.files?.length) {
+                  addImages(e.dataTransfer.files);
+                }
+              }}
+              className={`w-full px-4 py-8 border-2 border-dashed rounded-lg text-center cursor-pointer transition ${
+                isDragging
+                  ? "border-blue-500 bg-blue-50"
+                  : "border-gray-300 bg-gray-50 hover:bg-gray-100"
+              }`}
+            >
+              <p className="text-sm text-gray-700 font-medium">
+                Drop images here or click to select
+              </p>
+              <p className="text-xs text-gray-500 mt-1">
+                JPG, PNG, WebP, BMP — multiple allowed
+              </p>
+              <input
+                ref={imageInputRef}
+                type="file"
+                accept="image/jpeg,image/png,image/webp,image/bmp"
+                multiple
+                onChange={(e) => {
+                  if (e.target.files) addImages(e.target.files);
+                  // Reset so selecting the same file again still fires onChange
+                  e.target.value = "";
+                }}
+                className="hidden"
+              />
+            </div>
+            <p className="text-xs text-gray-500 mt-2">
+              Static images composited around the subtitles (equivalent to the
+              local <code>input/</code> folder). Provide at least 4 for the best
+              layout; fewer will be repeated.
+            </p>
+            {imageFiles.length > 0 && (
+              <ul className="mt-2 space-y-1">
+                {imageFiles.map((f, i) => (
+                  <li
+                    key={`${f.name}:${f.size}`}
+                    className="flex items-center justify-between text-xs text-gray-600 bg-gray-50 px-2 py-1 rounded"
+                  >
+                    <span className="truncate">
+                      {f.name}{" "}
+                      <span className="text-gray-400">
+                        ({(f.size / 1024).toFixed(0)} KB)
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => removeImage(i)}
+                      className="ml-2 text-red-500 hover:text-red-700 px-2 shrink-0"
+                      aria-label={`Remove ${f.name}`}
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))}
+                <li className="text-xs text-gray-500 pt-1">
+                  {imageFiles.length} file{imageFiles.length === 1 ? "" : "s"} selected
+                </li>
+              </ul>
             )}
           </div>
 

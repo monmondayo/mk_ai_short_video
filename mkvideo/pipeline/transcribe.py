@@ -4,19 +4,109 @@ import json
 import os
 import re
 from pathlib import Path
+from typing import Callable, Optional
 
 import anthropic
 import whisper
 
 
-def transcribe_video(video_path: Path, model_name: str = "medium", language: str | None = "ja") -> dict:
+def _install_whisper_progress_hook(
+    callback: Callable[[float], None],
+) -> Callable[[], None]:
+    """Monkey-patch whisper's internal tqdm so we can report progress.
+
+    whisper.transcribe uses ``tqdm.tqdm(total=content_frames, ...)`` as a
+    context manager and calls ``.update(n)`` as frames are decoded. We
+    replace the ``tqdm`` module reference inside ``whisper.transcribe``
+    with a shim whose ``tqdm`` attribute forwards ``update`` to our
+    callback as a fraction in [0, 1]. Returns a restore() function the
+    caller must invoke in ``finally``.
+
+    Note: we can't use ``import whisper.transcribe as _wt`` because
+    ``whisper/__init__.py`` does ``from .transcribe import transcribe``,
+    which rebinds the ``transcribe`` attribute on the ``whisper`` package
+    to the *function* — so the ``as _wt`` alias resolves to the function,
+    not the submodule. ``importlib.import_module`` returns the actual
+    submodule regardless of package-level shadowing.
+    """
+    import importlib
+
+    _wt = importlib.import_module("whisper.transcribe")
+
+    original_tqdm = _wt.tqdm
+
+    class _ProgressTqdm:
+        def __init__(self, *args, total=None, **kwargs):
+            self.total = total or 0
+            self.n = 0
+
+        def update(self, n=1):
+            self.n += n
+            if self.total > 0:
+                try:
+                    callback(min(1.0, self.n / self.total))
+                except Exception:
+                    # Never let a progress reporting failure break whisper
+                    pass
+
+        def close(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        # No-op shims for any other tqdm APIs whisper may touch
+        def set_postfix(self, *a, **k):
+            pass
+
+        def set_description(self, *a, **k):
+            pass
+
+        def refresh(self):
+            pass
+
+    class _ShimTqdmModule:
+        tqdm = _ProgressTqdm
+
+    _wt.tqdm = _ShimTqdmModule
+
+    def restore():
+        _wt.tqdm = original_tqdm
+
+    return restore
+
+
+def transcribe_video(
+    video_path: Path,
+    model_name: str = "medium",
+    language: str | None = "ja",
+    progress_callback: Optional[Callable[[float], None]] = None,
+) -> dict:
+    """Transcribe ``video_path`` with Whisper.
+
+    Args:
+        progress_callback: Optional function receiving a float in [0, 1]
+            as decoding advances. Called frequently — callers should
+            throttle if forwarding to a remote service.
+    """
     lang_hint = f", language={language}" if language else ""
     print(f"\n[2/5] Transcribing with Whisper ({model_name}{lang_hint})...")
     model = whisper.load_model(model_name)
     kwargs: dict = {"verbose": False, "word_timestamps": True}
     if language:
         kwargs["language"] = language
-    result = model.transcribe(str(video_path), **kwargs)
+
+    restore = None
+    if progress_callback is not None:
+        restore = _install_whisper_progress_hook(progress_callback)
+    try:
+        result = model.transcribe(str(video_path), **kwargs)
+    finally:
+        if restore is not None:
+            restore()
     segments = [
         {
             "start": s["start"],

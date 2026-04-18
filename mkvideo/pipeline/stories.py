@@ -2,6 +2,7 @@
 
 import json
 import os
+from typing import Callable, Optional
 
 import anthropic
 
@@ -76,7 +77,15 @@ def extract_stories(
     video_duration: float | None = None,
     min_dur: int = MIN_STORY_DURATION,
     max_dur: int = MAX_STORY_DURATION,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> list[dict]:
+    """Extract stories from transcript via Claude.
+
+    Args:
+        progress_callback: Optional callback ``(current, total, detail)``
+            invoked once per story as Claude streams them back, plus
+            once at start and once at finish.
+    """
     print(f"\n[3/5] Extracting {num_stories} stories with Claude...")
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
@@ -95,7 +104,24 @@ def extract_stories(
         min_total=min_dur, max_total=max_dur,
         min_seg=min_seg, max_seg=max_seg,
     )
-    message = client.messages.create(
+
+    def _notify(current: int, total: int, detail: str) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(current, total, detail)
+        except Exception:
+            # Progress reporting must never break extraction
+            pass
+
+    _notify(0, num_stories, "Analyzing transcript with Claude...")
+
+    # Stream so we can report per-story progress as Claude generates them.
+    # We detect new stories by counting '"rank"' occurrences in the
+    # accumulated output — one per story object in the JSON schema.
+    raw_parts: list[str] = []
+    last_count = 0
+    with client.messages.stream(
         model="claude-opus-4-6",
         max_tokens=4096,
         system=system,
@@ -103,13 +129,32 @@ def extract_stories(
             f"{duration_note}Create exactly {num_stories} stories.\n\nTRANSCRIPT:\n"
             + "\n".join(lines)
         )}],
-    )
-    raw = message.content[0].text.strip()
+    ) as stream:
+        for delta in stream.text_stream:
+            raw_parts.append(delta)
+            # Cheap incremental check — count once when new chunk arrives.
+            count = 0
+            # Scan only the freshly appended text plus a small tail to catch
+            # occurrences straddling the previous boundary.
+            joined_tail = "".join(raw_parts[-4:])
+            count = joined_tail.count('"rank"')
+            # Re-derive absolute count from full buffer when needed
+            total_count = ("".join(raw_parts)).count('"rank"')
+            if total_count != last_count and total_count <= num_stories:
+                last_count = total_count
+                _notify(
+                    total_count, num_stories,
+                    f"Selected story {total_count}/{num_stories}",
+                )
+            _ = count  # silence unused
+
+    raw = "".join(raw_parts).strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
     stories = json.loads(raw.strip())["stories"]
+    _notify(len(stories), num_stories, "Normalizing story durations...")
     print(f"   Created {len(stories)} stories:")
     for s in stories:
         segs = s["segments"]
