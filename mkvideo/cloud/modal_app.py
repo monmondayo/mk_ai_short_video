@@ -29,6 +29,8 @@ Note:
   to R2 before submitting a job. Use cloud/upload_helper.py for this.
 """
 
+import re
+
 import modal
 
 # ── Container image ──────────────────────────────────────────────────
@@ -46,6 +48,9 @@ mkvideo_image = (
         "Janome>=0.5.0",
         "boto3>=1.34.0",
         "requests>=2.31.0",
+        # Required by the @modal.asgi_app() web API (FastAPI + ASGI server)
+        "fastapi>=0.110.0",
+        "pydantic>=2.0.0",
     )
     # Copy local mkvideo package into the container image
     # so that `from mkvideo.pipeline.transcribe import ...` works.
@@ -75,17 +80,28 @@ def _download_video_from_r2(r2, job_id: str, dest_dir) -> "Path":
         Bucket=r2.bucket_name, Prefix=prefix_key, MaxKeys=10
     )
     video_key = None
-    video_name = "source.mp4"
+    video_ext = ".mp4"
     for obj in response.get("Contents", []):
         key = obj["Key"]
-        if any(key.endswith(ext) for ext in (".mp4", ".mkv", ".webm", ".avi")):
-            video_key = key
-            video_name = key.rsplit("/", 1)[-1]
+        for ext in (".mp4", ".mkv", ".mov", ".webm", ".avi"):
+            if key.lower().endswith(ext):
+                video_key = key
+                video_ext = ext
+                break
+        if video_key:
             break
     if not video_key:
         raise RuntimeError(f"Source video not found in R2 at {prefix_key}")
 
-    video_path = dest_dir / video_name
+    # IMPORTANT: use a short fixed local filename — the R2 key can contain
+    # a long Japanese title, and boto3's transfer manager appends a random
+    # suffix (".<hex>") to the destination path while writing. A long title
+    # + suffix easily exceeds the 255-byte per-component filesystem limit
+    # on Linux (ext4), causing OSError: [Errno 36] File name too long.
+    # The filename isn't meaningful downstream: ffmpeg/Whisper only need
+    # the extension to dispatch, and the user-facing title is stored
+    # separately in the jobs table.
+    video_path = dest_dir / f"source{video_ext}"
     r2.s3.download_file(r2.bucket_name, video_key, str(video_path))
     return video_path
 
@@ -133,10 +149,46 @@ def transcribe_video_job(
             video_path = _download_video_from_r2(r2, job_id, tmpdir)
             db.update_job_progress(job_id, "downloading", 1, 1, "Download complete")
 
-            # Step 2: Transcribe
+            # Step 2: Transcribe (with live progress forwarded to Supabase)
             db.update_job_status(job_id, "transcribing")
+            db.update_job_progress(
+                job_id, "transcribing", 0, 100,
+                "Loading Whisper model...",
+            )
             language = whisper_language if whisper_language else None
-            transcript = transcribe_video(video_path, model_name=whisper_model, language=language)
+
+            import time
+            _state = {"last_t": 0.0, "last_pct": -1}
+
+            def _progress(frac: float) -> None:
+                """Throttle: update at most ~once/sec AND only on %-changes.
+
+                Avoids overwhelming Supabase Realtime with hundreds of
+                writes during a long transcription.
+                """
+                now = time.monotonic()
+                pct = int(frac * 100)
+                if pct == _state["last_pct"]:
+                    return
+                if pct < 100 and (now - _state["last_t"]) < 1.0:
+                    return
+                _state["last_pct"] = pct
+                _state["last_t"] = now
+                try:
+                    db.update_job_progress(
+                        job_id, "transcribing",
+                        current=pct, total=100,
+                        detail=f"Transcribing audio ({pct}%)",
+                    )
+                except Exception as e:
+                    print(f"[transcribe progress update failed] {e}")
+
+            transcript = transcribe_video(
+                video_path,
+                model_name=whisper_model,
+                language=language,
+                progress_callback=_progress,
+            )
 
             # Save raw transcript to R2
             raw_key = "transcript/raw.json"
@@ -178,24 +230,24 @@ def transcribe_video_job(
         raise
 
 
-# ── Job 2: Extract Stories + Render ──────────────────────────────────
+# ── Job 2a: Extract stories (Claude only, fast) ─────────────────────
+# Splitting extract from render lets the user edit story titles/hooks
+# in the web editor before we spend minutes rendering.
 @app.function(
     secrets=[secrets],
-    timeout=7200,   # 2 hours max (rendering is slow)
-    memory=8192,    # 8 GB RAM
-    cpu=4.0,        # 4 vCPUs for ffmpeg
+    timeout=900,    # 15 min is plenty for Claude extraction
+    memory=4096,
 )
-def extract_and_render(
+def extract_stories_job(
     job_id: str,
     num_stories: int = 10,
     duration_preset: str = "30-60",
-    bg_color: str = "white",
-    add_captions: bool = True,
 ) -> dict:
-    """Phase 2: Extract stories with Claude, render all short videos.
+    """Phase 2a: Extract stories with Claude, save to Supabase.
 
-    Called after user reviews/edits transcript.
-    Downloads source video from R2, renders, uploads results.
+    On success sets status to ``awaiting_story_review`` so the user can
+    edit titles/hooks before rendering. Render is kicked off separately
+    via :func:`render_videos_job`.
     """
     import tempfile
     from pathlib import Path
@@ -205,11 +257,108 @@ def extract_and_render(
         DURATION_PRESETS,
         DURATION_TOLERANCE_SEC,
     )
+    from mkvideo.pipeline.render import get_video_info
+    from mkvideo.pipeline.stories import enforce_story_duration_range, extract_stories
+    from mkvideo.storage.r2 import R2Storage
+
+    db = SupabaseJobClient()
+    r2 = R2Storage(prefix=f"jobs/{job_id}")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+
+            db.update_job_status(job_id, "extracting")
+
+            # We need the video only to read its duration (ffprobe).
+            # Could be optimized later by storing duration at upload time.
+            video_path = _download_video_from_r2(r2, job_id, tmp)
+
+            transcript_data = db.get_transcript(job_id)
+            if not transcript_data:
+                raise RuntimeError("Transcript not found")
+            transcript = {
+                "text": "".join(s["text"] for s in transcript_data["segments"]),
+                "segments": transcript_data["segments"],
+            }
+
+            info = get_video_info(video_path)
+
+            min_dur, max_dur = DURATION_PRESETS.get(duration_preset, (30, 60))
+
+            def _story_progress(current: int, total: int, detail: str) -> None:
+                try:
+                    db.update_job_progress(
+                        job_id, "extracting",
+                        current=current, total=total,
+                        detail=detail,
+                    )
+                except Exception as e:
+                    print(f"[extracting progress update failed] {e}")
+
+            stories = extract_stories(
+                transcript,
+                num_stories=num_stories,
+                video_duration=info["duration"],
+                min_dur=min_dur,
+                max_dur=max_dur,
+                progress_callback=_story_progress,
+            )
+
+            enforce_story_duration_range(
+                stories,
+                min_total=min_dur,
+                max_total=max_dur,
+                video_duration=info["duration"],
+                tolerance_sec=DURATION_TOLERANCE_SEC,
+            )
+
+            db.save_stories(job_id, stories)
+
+            db.update_job_status(
+                job_id, "awaiting_story_review",
+                progress={
+                    "step": "awaiting_story_review",
+                    "current": len(stories),
+                    "total": len(stories),
+                    "detail": "Stories ready for review",
+                },
+            )
+            return {"job_id": job_id, "story_count": len(stories)}
+
+    except Exception as e:
+        db.update_job_status(job_id, "failed", error_message=str(e))
+        raise
+
+
+# ── Job 2b: Render videos (heavy ffmpeg work) ────────────────────────
+@app.function(
+    secrets=[secrets],
+    timeout=7200,   # 2 hours max (rendering is slow)
+    memory=8192,    # 8 GB RAM
+    cpu=4.0,        # 4 vCPUs for ffmpeg
+)
+def render_videos_job(
+    job_id: str,
+    duration_preset: str = "30-60",
+    bg_color: str = "white",
+    add_captions: bool = True,
+) -> dict:
+    """Phase 2b: Render all short videos from stories saved in Supabase.
+
+    Called after the user approves (and possibly edits) the extracted
+    stories. Reads the latest ``stories_json`` from Supabase so any
+    edits from the StoryEditor are applied.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from mkvideo.cloud.supabase_client import SupabaseJobClient
+    from mkvideo.pipeline.constants import DURATION_PRESETS
     from mkvideo.pipeline.render import (
-        get_video_info,
+        get_clip_duration,
         render_all_stories,
     )
-    from mkvideo.pipeline.stories import enforce_story_duration_range, extract_stories
     from mkvideo.storage.r2 import R2Storage
 
     db = SupabaseJobClient()
@@ -221,16 +370,14 @@ def extract_and_render(
             out_dir = tmp / "output"
             out_dir.mkdir()
 
-            # Get job info
             job = db.get_job(job_id)
             if not job:
                 raise RuntimeError(f"Job {job_id} not found")
 
-            # Download source video from R2
-            db.update_job_status(job_id, "extracting")
-            video_path = _download_video_from_r2(r2, job_id, tmp)
+            stories = db.get_stories(job_id)
+            if not stories:
+                raise RuntimeError("Stories not found — extraction must run first")
 
-            # Get transcript from Supabase
             transcript_data = db.get_transcript(job_id)
             if not transcript_data:
                 raise RuntimeError("Transcript not found")
@@ -239,45 +386,54 @@ def extract_and_render(
                 "segments": transcript_data["segments"],
             }
 
-            # Get video info
-            info = get_video_info(video_path)
-
-            # Extract stories
-            min_dur, max_dur = DURATION_PRESETS.get(duration_preset, (30, 60))
-            stories = extract_stories(
-                transcript,
-                num_stories=num_stories,
-                video_duration=info["duration"],
-                min_dur=min_dur,
-                max_dur=max_dur,
-            )
-
-            # Normalize durations
-            enforce_story_duration_range(
-                stories,
-                min_total=min_dur,
-                max_total=max_dur,
-                video_duration=info["duration"],
-                tolerance_sec=DURATION_TOLERANCE_SEC,
-            )
-
-            # Save stories to Supabase
-            db.save_stories(job_id, stories)
-
-            # Render
             db.update_job_status(job_id, "rendering")
+            video_path = _download_video_from_r2(r2, job_id, tmp)
 
-            # Override TEMP_DIR to use tmpdir
+            # Override TEMP_DIR / INPUT_DIR for ephemeral container work
             import mkvideo.pipeline.constants as constants
             constants.TEMP_DIR = tmp / "temp"
             constants.TEMP_DIR.mkdir()
             constants.INPUT_DIR = tmp / "input"
             constants.INPUT_DIR.mkdir()
 
-            # TODO: Download input images from R2 if user uploaded any
+            # Download overlay images (optional) from R2 jobs/{id}/input/
             input_images = []
+            _image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+            input_prefix = r2._key("input/")
+            try:
+                paginator = r2.s3.get_paginator("list_objects_v2")
+                for page in paginator.paginate(
+                    Bucket=r2.bucket_name, Prefix=input_prefix
+                ):
+                    for obj in page.get("Contents", []):
+                        key = obj["Key"]
+                        name = key.rsplit("/", 1)[-1]
+                        if not name:
+                            continue
+                        if Path(name).suffix.lower() not in _image_exts:
+                            continue
+                        dest = constants.INPUT_DIR / name
+                        r2.s3.download_file(r2.bucket_name, key, str(dest))
+                        input_images.append(dest)
+            except Exception as e:
+                print(f"[render_videos_job] No input images loaded: {e}")
+            if input_images:
+                print(f"[render_videos_job] Loaded {len(input_images)} overlay images")
 
-            video_title = job.get("video_title", job.get("youtube_url", ""))
+            _, max_dur = DURATION_PRESETS.get(duration_preset, (30, 60))
+            # Strip video file extensions so they don't end up burnt into
+            # the top-of-frame title text. The frontend already does this
+            # for new uploads, but legacy jobs and YouTube URLs may still
+            # carry an extension through to render time. Strip whitespace
+            # first so trailing spaces don't hide the extension from the
+            # regex anchor.
+            video_title = job.get("video_title", job.get("youtube_url", "")).strip()
+            video_title = re.sub(
+                r"\.(mp4|mkv|mov|webm|avi|m4v|flv|wmv|mpg|mpeg|ts)$",
+                "",
+                video_title,
+                flags=re.IGNORECASE,
+            ).strip()
 
             output_paths = render_all_stories(
                 video_path, stories, transcript, out_dir,
@@ -288,18 +444,13 @@ def extract_and_render(
                 video_title=video_title,
             )
 
-            # Upload finished videos to R2 and record in Supabase
             for path in output_paths:
                 r2_key = f"output/{path.name}"
                 r2.save_file(path, r2_key)
 
-                # Extract rank from filename (e.g., "01_title.mp4" -> 1)
                 rank = int(path.stem.split("_")[0])
                 story = next((s for s in stories if s["rank"] == rank), {})
                 size_mb = path.stat().st_size / 1024 / 1024
-
-                # Get video duration
-                from mkvideo.pipeline.render import get_clip_duration
                 duration = get_clip_duration(path)
 
                 db.save_output_video(
@@ -317,11 +468,14 @@ def extract_and_render(
                     detail=f"Rendered {path.name}",
                 )
 
-            db.update_job_status(job_id, "complete",
-                                progress={"step": "complete",
-                                          "current": len(output_paths),
-                                          "total": len(stories)})
-
+            db.update_job_status(
+                job_id, "complete",
+                progress={
+                    "step": "complete",
+                    "current": len(output_paths),
+                    "total": len(stories),
+                },
+            )
             return {
                 "job_id": job_id,
                 "videos_rendered": len(output_paths),
@@ -334,101 +488,234 @@ def extract_and_render(
 
 
 # ── Web API Endpoints ────────────────────────────────────────────────
-# These are called by the Next.js frontend via Vercel API routes.
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-
-web_app = FastAPI()
-
-
-class SubmitJobRequest(BaseModel):
-    job_id: str
-    whisper_model: str = "medium"
-    whisper_language: str = "ja"
-    skip_proofread: bool = False
-
-
-class StartRenderRequest(BaseModel):
-    job_id: str
-    num_stories: int = 10
-    duration_preset: str = "30-60"
-    bg_color: str = "white"
-    add_captions: bool = True
-
-
-class UploadUrlRequest(BaseModel):
-    job_id: str
-    filename: str
-    content_type: str = "video/mp4"
-
-
-@web_app.post("/submit-job")
-async def submit_job(req: SubmitJobRequest):
-    """Start Phase 1: transcribe video already in R2. Returns immediately with call_id.
-
-    The video must already be uploaded to R2 at jobs/{job_id}/source/<filename>.
-    Use POST /upload-url to get a presigned URL for uploading first.
-    """
-    call = await transcribe_video_job.spawn.aio(
-        job_id=req.job_id,
-        whisper_model=req.whisper_model,
-        whisper_language=req.whisper_language,
-        skip_proofread=req.skip_proofread,
-    )
-    return {"call_id": call.object_id, "job_id": req.job_id}
-
-
-@web_app.post("/start-render")
-async def start_render(req: StartRenderRequest):
-    """Start Phase 2: extract stories + render. Called after transcript review."""
-    call = await extract_and_render.spawn.aio(
-        job_id=req.job_id,
-        num_stories=req.num_stories,
-        duration_preset=req.duration_preset,
-        bg_color=req.bg_color,
-        add_captions=req.add_captions,
-    )
-    return {"call_id": call.object_id, "job_id": req.job_id}
-
-
-@web_app.post("/upload-url")
-async def get_upload_url(req: UploadUrlRequest):
-    """Get a presigned URL for uploading a video to R2.
-
-    The frontend or CLI uploads the video directly to R2 using this URL,
-    then calls POST /submit-job to start processing.
-    """
-    import os
-    from mkvideo.storage.r2 import R2Storage
-
-    r2 = R2Storage(prefix=f"jobs/{req.job_id}")
-    upload_url = r2.generate_upload_url(
-        f"source/{req.filename}",
-        expires_in=3600,
-        content_type=req.content_type,
-    )
-    return {
-        "upload_url": upload_url,
-        "r2_key": f"jobs/{req.job_id}/source/{req.filename}",
-    }
-
-
-@web_app.get("/job-status/{call_id}")
-async def job_status(call_id: str):
-    """Check if a Modal function call has completed."""
-    try:
-        call = modal.FunctionCall.from_id(call_id)
-        result = call.get(timeout=0)
-        return {"status": "completed", "result": result}
-    except TimeoutError:
-        return {"status": "running"}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
+# FastAPI/Pydantic are imported INSIDE api() so the other Modal functions
+# (transcribe_video_job, extract_and_render) don't need fastapi in their
+# module-load path. Only the api() container ever imports fastapi.
 
 @app.function(secrets=[secrets])
 @modal.asgi_app()
 def api():
-    """ASGI endpoint serving the FastAPI web app."""
+    """ASGI endpoint serving the FastAPI web app.
+
+    Called by the Next.js frontend via Vercel API routes.
+    """
+    from fastapi import FastAPI, HTTPException
+    from fastapi.middleware.cors import CORSMiddleware
+    from pydantic import BaseModel
+
+    web_app = FastAPI()
+
+    # Allow the Next.js frontend (Vercel + localhost) to call this API
+    # directly from the browser. Browsers send a preflight OPTIONS for
+    # POST with JSON bodies, which FastAPI won't answer without CORS.
+    web_app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"^https://([a-z0-9-]+\.)*vercel\.app$|^http://localhost(:\d+)?$",
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+        max_age=3600,
+    )
+
+    class SubmitJobRequest(BaseModel):
+        job_id: str
+        whisper_model: str = "medium"
+        whisper_language: str = "ja"
+        skip_proofread: bool = False
+
+    class StartExtractRequest(BaseModel):
+        """Phase 2a: called after transcript review, runs Claude extraction."""
+        job_id: str
+        num_stories: int = 10
+        duration_preset: str = "30-60"
+
+    class StartRenderRequest(BaseModel):
+        """Phase 2b: called after story review, renders videos."""
+        job_id: str
+        duration_preset: str = "30-60"
+        bg_color: str = "white"
+        add_captions: bool = True
+
+    class UploadUrlRequest(BaseModel):
+        job_id: str
+        filename: str
+        content_type: str = "video/mp4"
+        # Sub-path inside the job folder. Use "source" for the main video
+        # (default) or "input" for overlay images that should be composited
+        # into the output.
+        path_prefix: str = "source"
+
+    class DownloadUrlRequest(BaseModel):
+        """Request a presigned URL for downloading a rendered output video.
+
+        The ``key`` is the value stored in ``output_videos.r2_url`` — which
+        despite the column name is an R2 object key *relative to the job
+        prefix* (e.g. ``"output/02_video.mp4"``), not an absolute URL.
+        """
+        job_id: str
+        key: str
+        filename: str = "video.mp4"
+
+    class DeleteR2FilesRequest(BaseModel):
+        """Delete every R2 object under ``jobs/<job_id>/``.
+
+        The Supabase row is expected to have been deleted first via RLS
+        from the browser — this endpoint only reclaims R2 storage. Since
+        job IDs are UUIDs (2^122 entropy) we treat possession of the ID
+        as sufficient authorization for cleanup; the worst-case abuse is
+        an attacker guessing a UUID to free someone else's R2 storage.
+        """
+        job_id: str
+
+    @web_app.post("/submit-job")
+    async def submit_job(req: SubmitJobRequest):
+        """Start Phase 1: transcribe video already in R2. Returns call_id.
+
+        The video must already be uploaded to R2 at
+        jobs/{job_id}/source/<filename>. Use POST /upload-url to get a
+        presigned URL for uploading first.
+        """
+        call = await transcribe_video_job.spawn.aio(
+            job_id=req.job_id,
+            whisper_model=req.whisper_model,
+            whisper_language=req.whisper_language,
+            skip_proofread=req.skip_proofread,
+        )
+        return {"call_id": call.object_id, "job_id": req.job_id}
+
+    @web_app.post("/start-extract")
+    async def start_extract(req: StartExtractRequest):
+        """Start Phase 2a: extract stories only (quick Claude call)."""
+        call = await extract_stories_job.spawn.aio(
+            job_id=req.job_id,
+            num_stories=req.num_stories,
+            duration_preset=req.duration_preset,
+        )
+        return {"call_id": call.object_id, "job_id": req.job_id}
+
+    @web_app.post("/start-render")
+    async def start_render(req: StartRenderRequest):
+        """Start Phase 2b: render videos from (possibly edited) stories."""
+        call = await render_videos_job.spawn.aio(
+            job_id=req.job_id,
+            duration_preset=req.duration_preset,
+            bg_color=req.bg_color,
+            add_captions=req.add_captions,
+        )
+        return {"call_id": call.object_id, "job_id": req.job_id}
+
+    @web_app.post("/upload-url")
+    async def get_upload_url(req: UploadUrlRequest):
+        """Get a presigned URL for uploading a file to R2."""
+        from mkvideo.storage.r2 import R2Storage
+
+        # Whitelist sub-paths to avoid unexpected keys
+        sub = req.path_prefix.strip("/").lower()
+        if sub not in ("source", "input"):
+            raise HTTPException(
+                status_code=400,
+                detail="path_prefix must be 'source' or 'input'",
+            )
+
+        r2 = R2Storage(prefix=f"jobs/{req.job_id}")
+        sub_key = f"{sub}/{req.filename}"
+        upload_url = r2.generate_upload_url(
+            sub_key,
+            expires_in=3600,
+            content_type=req.content_type,
+        )
+        return {
+            "upload_url": upload_url,
+            "r2_key": f"jobs/{req.job_id}/{sub_key}",
+        }
+
+    @web_app.post("/download-url")
+    async def get_download_url(req: DownloadUrlRequest):
+        """Return presigned GET URLs for playing or downloading a video.
+
+        Returns two URLs for the same object:
+        - ``view_url``: inline disposition — safe to set on ``<video src>``.
+        - ``download_url``: attachment disposition with the requested
+          ``filename`` so the browser saves it with a useful name instead
+          of the R2 key.
+        """
+        from mkvideo.storage.r2 import R2Storage
+
+        # Normalize: tolerate callers that accidentally pass either a
+        # leading slash or the full ``jobs/<id>/`` prefix.
+        rel = req.key.lstrip("/")
+        job_prefix = f"jobs/{req.job_id}/"
+        if rel.startswith(job_prefix):
+            rel = rel[len(job_prefix):]
+
+        r2 = R2Storage(prefix=f"jobs/{req.job_id}")
+        full_key = r2._key(rel)
+
+        # RFC 6266: quote the filename and strip characters that would
+        # break the header. Browsers fall back to the URL basename if the
+        # header is malformed, so we prefer safety over fidelity.
+        safe_name = req.filename.replace('"', "").replace("\\", "").replace("\n", "")
+        if not safe_name:
+            safe_name = "video.mp4"
+
+        view_url = r2.s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": r2.bucket_name, "Key": full_key},
+            ExpiresIn=3600,
+        )
+        download_url = r2.s3.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": r2.bucket_name,
+                "Key": full_key,
+                "ResponseContentDisposition": f'attachment; filename="{safe_name}"',
+            },
+            ExpiresIn=3600,
+        )
+        return {"view_url": view_url, "download_url": download_url}
+
+    @web_app.post("/delete-r2-files")
+    async def delete_r2_files(req: DeleteR2FilesRequest):
+        """Best-effort cleanup of all R2 objects under ``jobs/<job_id>/``.
+
+        Returns the count of deleted objects. Safe to call on a prefix
+        that no longer exists (paginator yields nothing).
+        """
+        from mkvideo.storage.r2 import R2Storage
+
+        r2 = R2Storage(prefix=f"jobs/{req.job_id}")
+        # R2Storage._key("") returns "jobs/<id>/" (list-prefix form).
+        prefix = r2._key("")
+        if not prefix.endswith("/"):
+            prefix += "/"
+
+        paginator = r2.s3.get_paginator("list_objects_v2")
+        total_deleted = 0
+        for page in paginator.paginate(Bucket=r2.bucket_name, Prefix=prefix):
+            objects = page.get("Contents", [])
+            if not objects:
+                continue
+            # S3 delete_objects caps at 1000 keys per call — paginator
+            # pages are already bounded to 1000 by default.
+            keys = [{"Key": obj["Key"]} for obj in objects]
+            r2.s3.delete_objects(
+                Bucket=r2.bucket_name,
+                Delete={"Objects": keys, "Quiet": True},
+            )
+            total_deleted += len(keys)
+
+        return {"deleted": total_deleted, "prefix": prefix}
+
+    @web_app.get("/job-status/{call_id}")
+    async def job_status(call_id: str):
+        """Check if a Modal function call has completed."""
+        try:
+            call = modal.FunctionCall.from_id(call_id)
+            result = call.get(timeout=0)
+            return {"status": "completed", "result": result}
+        except TimeoutError:
+            return {"status": "running"}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
     return web_app

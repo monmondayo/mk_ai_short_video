@@ -32,6 +32,13 @@ export default async function JobDetailPage({
     .eq("job_id", id)
     .single();
 
+  // Fetch stories (if extracted)
+  const { data: storiesRow } = await supabase
+    .from("stories")
+    .select("stories_json")
+    .eq("job_id", id)
+    .single();
+
   // Fetch output videos (if any)
   const { data: videos } = await supabase
     .from("output_videos")
@@ -46,6 +53,7 @@ export default async function JobDetailPage({
         <JobDetailClient
           job={job}
           transcript={transcript}
+          stories={storiesRow?.stories_json ?? null}
           videos={videos || []}
         />
       </main>

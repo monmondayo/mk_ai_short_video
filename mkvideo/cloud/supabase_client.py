@@ -52,6 +52,26 @@ class SupabaseJobClient:
         resp.raise_for_status()
         return resp.json()
 
+    def _upsert(
+        self,
+        table: str,
+        data: dict | list[dict],
+        on_conflict: str,
+    ) -> dict:
+        """Insert or update via PostgREST merge-duplicates.
+
+        Uses the ``Prefer: resolution=merge-duplicates`` header together
+        with ``?on_conflict=...`` so a repeated run over the same
+        (job_id, rank) etc. overwrites instead of 409-ing.
+        """
+        url = self._rest_url(table)
+        headers = dict(self.headers)
+        headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+        params = {"on_conflict": on_conflict}
+        resp = requests.post(url, headers=headers, params=params, json=data)
+        resp.raise_for_status()
+        return resp.json()
+
     def _get(self, table: str, match: dict, select: str = "*") -> list[dict]:
         """Select rows matching the given filters."""
         url = self._rest_url(table)
@@ -164,6 +184,17 @@ class SupabaseJobClient:
         if not result:
             self._post("stories", data)
 
+    def get_stories(self, job_id: str) -> list[dict] | None:
+        """Return the ``stories_json`` array saved for this job, or None."""
+        url = self._rest_url("stories")
+        params = {"job_id": f"eq.{job_id}", "select": "stories_json"}
+        resp = requests.get(url, headers=self.headers, params=params)
+        resp.raise_for_status()
+        rows = resp.json()
+        if not rows:
+            return None
+        return rows[0].get("stories_json")
+
     # ── Output video operations ───────────────────────────────────────
 
     def save_output_video(
@@ -175,15 +206,24 @@ class SupabaseJobClient:
         duration_sec: float,
         file_size_mb: float,
     ) -> None:
-        """Record a finished output video."""
-        self._post("output_videos", {
-            "job_id": job_id,
-            "rank": rank,
-            "title": title,
-            "r2_url": r2_url,
-            "duration_sec": duration_sec,
-            "file_size_mb": file_size_mb,
-        })
+        """Record a finished output video (upsert on job_id+rank).
+
+        Using upsert lets a re-run of the render phase overwrite the
+        previous row for the same (job_id, rank) instead of failing with
+        a 409 unique-constraint conflict.
+        """
+        self._upsert(
+            "output_videos",
+            {
+                "job_id": job_id,
+                "rank": rank,
+                "title": title,
+                "r2_url": r2_url,
+                "duration_sec": duration_sec,
+                "file_size_mb": file_size_mb,
+            },
+            on_conflict="job_id,rank",
+        )
 
     # ── Job retrieval ─────────────────────────────────────────────────
 

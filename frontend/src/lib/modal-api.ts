@@ -15,9 +15,22 @@ export async function submitJob(params: {
   return res.json();
 }
 
-export async function startRender(params: {
+export async function startExtract(params: {
   job_id: string;
   num_stories?: number;
+  duration_preset?: string;
+}) {
+  const res = await fetch(`${MODAL_API_URL}/start-extract`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) throw new Error(`start-extract failed: ${res.statusText}`);
+  return res.json();
+}
+
+export async function startRender(params: {
+  job_id: string;
   duration_preset?: string;
   bg_color?: string;
   add_captions?: boolean;
@@ -35,6 +48,8 @@ export async function getUploadUrl(params: {
   job_id: string;
   filename: string;
   content_type?: string;
+  /** "source" for the main video (default) or "input" for overlay images. */
+  path_prefix?: "source" | "input";
 }) {
   const res = await fetch(`${MODAL_API_URL}/upload-url`, {
     method: "POST",
@@ -48,5 +63,41 @@ export async function getUploadUrl(params: {
 export async function getJobStatus(callId: string) {
   const res = await fetch(`${MODAL_API_URL}/job-status/${callId}`);
   if (!res.ok) throw new Error(`job-status failed: ${res.statusText}`);
+  return res.json();
+}
+
+/**
+ * Get presigned URLs for viewing / downloading a rendered output video.
+ *
+ * The `key` argument is the value of `output_videos.r2_url` — an R2 object
+ * key relative to the job prefix (e.g. "output/02_video.mp4"), NOT a URL.
+ * Both returned URLs are presigned and expire after 1 hour.
+ */
+export async function getDownloadUrl(params: {
+  job_id: string;
+  key: string;
+  filename: string;
+}): Promise<{ view_url: string; download_url: string }> {
+  const res = await fetch(`${MODAL_API_URL}/download-url`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) throw new Error(`download-url failed: ${res.statusText}`);
+  return res.json();
+}
+
+/**
+ * Delete every R2 object under `jobs/<job_id>/`. Best-effort — callers
+ * should catch errors so DB deletion still succeeds if R2 cleanup fails
+ * (orphaned objects can be cleaned up later).
+ */
+export async function deleteR2Files(jobId: string): Promise<{ deleted: number }> {
+  const res = await fetch(`${MODAL_API_URL}/delete-r2-files`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ job_id: jobId }),
+  });
+  if (!res.ok) throw new Error(`delete-r2-files failed: ${res.statusText}`);
   return res.json();
 }

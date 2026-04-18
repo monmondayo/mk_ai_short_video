@@ -3,8 +3,9 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase-browser";
-import { startRender } from "@/lib/modal-api";
+import { startExtract, startRender } from "@/lib/modal-api";
 import TranscriptEditor from "@/components/TranscriptEditor";
+import StoryEditor, { type Story } from "@/components/StoryEditor";
 import ProgressDisplay from "@/components/ProgressDisplay";
 import VideoResults from "@/components/VideoResults";
 
@@ -38,29 +39,26 @@ type OutputVideo = {
 export default function JobDetailClient({
   job,
   transcript,
+  stories,
   videos,
 }: {
   job: Job;
   transcript: Transcript;
+  stories: Story[] | null;
   videos: OutputVideo[];
 }) {
   const router = useRouter();
   const supabase = createClient();
-  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
-  const handleStartRender = async () => {
-    setSubmitting(true);
+  /** Phase 2a: after transcript review → kick off Claude extraction. */
+  const handleStartExtract = async () => {
     setError("");
     try {
-      // Save transcript first
-      // Then trigger render
-      const { call_id } = await startRender({
+      const { call_id } = await startExtract({
         job_id: job.id,
         num_stories: job.num_stories,
         duration_preset: job.duration_preset,
-        bg_color: job.bg_color,
-        add_captions: job.add_captions,
       });
 
       await supabase
@@ -70,9 +68,34 @@ export default function JobDetailClient({
 
       router.refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to start render");
+      const msg = err instanceof Error ? err.message : "Failed to start extract";
+      setError(msg);
+      throw err; // let the editor re-enable its button
     }
-    setSubmitting(false);
+  };
+
+  /** Phase 2b: after story review → kick off ffmpeg rendering. */
+  const handleStartRender = async () => {
+    setError("");
+    try {
+      const { call_id } = await startRender({
+        job_id: job.id,
+        duration_preset: job.duration_preset,
+        bg_color: job.bg_color,
+        add_captions: job.add_captions,
+      });
+
+      await supabase
+        .from("jobs")
+        .update({ modal_call_id: call_id, status: "rendering" })
+        .eq("id", job.id);
+
+      router.refresh();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to start render";
+      setError(msg);
+      throw err;
+    }
   };
 
   const isProcessing = [
@@ -86,6 +109,9 @@ export default function JobDetailClient({
 
   const showTranscript =
     job.status === "awaiting_review" && transcript?.segments;
+
+  const showStories =
+    job.status === "awaiting_story_review" && stories && stories.length > 0;
 
   return (
     <div className="space-y-6">
@@ -132,27 +158,48 @@ export default function JobDetailClient({
         </div>
       )}
 
-      {/* Transcript Editor (shown when awaiting review) */}
+      {/* Transcript Editor (shown when awaiting transcript review) */}
       {showTranscript && (
         <>
           <div className="bg-purple-50 border border-purple-200 rounded-lg p-4">
             <p className="text-sm text-purple-800">
               Transcription complete. Review and edit the transcript below,
-              then click <strong>&quot;Save & Continue&quot;</strong> to start rendering.
+              then click <strong>&quot;Save &amp; Continue&quot;</strong> to
+              extract stories.
             </p>
           </div>
           <TranscriptEditor
             jobId={job.id}
             segments={transcript!.segments}
-            onSave={handleStartRender}
+            onSave={handleStartExtract}
           />
           {error && (
             <p className="text-sm text-red-600 bg-red-50 px-3 py-2 rounded">
               {error}
             </p>
           )}
-          {submitting && (
-            <p className="text-sm text-blue-600">Starting render...</p>
+        </>
+      )}
+
+      {/* Story Editor (shown when awaiting story review) */}
+      {showStories && (
+        <>
+          <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+            <p className="text-sm text-amber-800">
+              Stories extracted. Review and edit titles and hooks below,
+              then click <strong>&quot;Save &amp; Render&quot;</strong> to
+              produce the short videos.
+            </p>
+          </div>
+          <StoryEditor
+            jobId={job.id}
+            stories={stories!}
+            onSave={handleStartRender}
+          />
+          {error && (
+            <p className="text-sm text-red-600 bg-red-50 px-3 py-2 rounded">
+              {error}
+            </p>
           )}
         </>
       )}

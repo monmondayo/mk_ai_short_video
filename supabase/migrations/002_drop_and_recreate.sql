@@ -43,6 +43,7 @@ create table public.jobs (
                       'transcribing',
                       'proofreading',
                       'awaiting_review',
+                      'awaiting_story_review',
                       'extracting',
                       'rendering',
                       'complete',

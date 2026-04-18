@@ -18,16 +18,17 @@ create table if not exists public.jobs (
     video_title   text default '',
     status        text not null default 'pending'
                   check (status in (
-                      'pending',           -- job created, waiting for video upload
-                      'uploading',         -- video being uploaded to R2
-                      'downloading',       -- (legacy) downloading from R2
-                      'transcribing',      -- Whisper running
-                      'proofreading',      -- Claude proofreading transcript
-                      'awaiting_review',   -- transcript ready, waiting for user
-                      'extracting',        -- Claude extracting stories
-                      'rendering',         -- ffmpeg rendering shorts
-                      'complete',          -- all done
-                      'failed'             -- error occurred
+                      'pending',                -- job created, waiting for video upload
+                      'uploading',              -- video being uploaded to R2
+                      'downloading',            -- (legacy) downloading from R2
+                      'transcribing',           -- Whisper running
+                      'proofreading',           -- Claude proofreading transcript
+                      'awaiting_review',        -- transcript ready, waiting for user
+                      'awaiting_story_review',  -- stories extracted, waiting for user
+                      'extracting',             -- Claude extracting stories
+                      'rendering',              -- ffmpeg rendering shorts
+                      'complete',               -- all done
+                      'failed'                  -- error occurred
                   )),
     progress      jsonb default '{}',
     -- progress schema: { "step": "transcribing", "current": 2, "total": 10, "detail": "..." }
