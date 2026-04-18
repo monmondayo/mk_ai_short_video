@@ -44,6 +44,31 @@ export async function startRender(params: {
   return res.json();
 }
 
+/**
+ * Phase 2b-prep: kicks off subtitle preparation (cut + join + SRT
+ * generation). Mirrors the local CLI's ``--review-subtitles`` pause.
+ *
+ * After Modal finishes, the job flips to ``awaiting_subtitle_review``
+ * and ``stories.subtitles_json`` contains one entry per story with
+ * ``{srt, durations, joined_key}``. The subsequent ``startRender`` call
+ * will detect that column and skip straight to Phase 2 (overlay only).
+ */
+export async function startPrepareSubtitles(params: {
+  job_id: string;
+  duration_preset?: string;
+  bg_color?: string;
+}) {
+  const res = await fetch(`${MODAL_API_URL}/start-prepare-subtitles`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    throw new Error(`start-prepare-subtitles failed: ${res.statusText}`);
+  }
+  return res.json();
+}
+
 export async function getUploadUrl(params: {
   job_id: string;
   filename: string;

@@ -32,10 +32,11 @@ export default async function JobDetailPage({
     .eq("job_id", id)
     .single();
 
-  // Fetch stories (if extracted)
+  // Fetch stories (if extracted). ``subtitles_json`` is populated only
+  // when the user opted into the --review-subtitles-equivalent pause.
   const { data: storiesRow } = await supabase
     .from("stories")
-    .select("stories_json")
+    .select("stories_json, subtitles_json")
     .eq("job_id", id)
     .single();
 
@@ -54,6 +55,7 @@ export default async function JobDetailPage({
           job={job}
           transcript={transcript}
           stories={storiesRow?.stories_json ?? null}
+          subtitles={storiesRow?.subtitles_json ?? null}
           videos={videos || []}
         />
       </main>

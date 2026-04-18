@@ -23,6 +23,8 @@ const STATUS_LABELS: Record<string, { label: string; color: string }> = {
   proofreading: { label: "Proofreading", color: "bg-yellow-100 text-yellow-700" },
   awaiting_review: { label: "Review Ready", color: "bg-purple-100 text-purple-700" },
   awaiting_story_review: { label: "Stories Ready", color: "bg-purple-100 text-purple-700" },
+  preparing_subtitles: { label: "Preparing Subtitles", color: "bg-orange-100 text-orange-700" },
+  awaiting_subtitle_review: { label: "Subtitles Ready", color: "bg-purple-100 text-purple-700" },
   extracting: { label: "Extracting", color: "bg-orange-100 text-orange-700" },
   rendering: { label: "Rendering", color: "bg-orange-100 text-orange-700" },
   complete: { label: "Complete", color: "bg-green-100 text-green-700" },

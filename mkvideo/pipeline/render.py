@@ -8,13 +8,13 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
+from . import constants as _const
 from .constants import (
     BOTTOM_ZONE_H,
     DURATION_TOLERANCE_SEC,
     IMG_CHANGE_INTERVAL,
     IMG_GAP,
     INNER_H,
-    INPUT_DIR,
     LOWER_FG,
     LOWER_STROKE,
     LOWER_Y,
@@ -29,7 +29,6 @@ from .constants import (
     SUBTITLE_WORD_GAP_SEC,
     TARGET_H,
     TARGET_W,
-    TEMP_DIR,
     TEXT_GAP,
     TEXT_PNG_H,
     TOP_ZONE_H,
@@ -44,6 +43,13 @@ from .constants import (
     _SUBTITLE_NO_START,
     estimate_joined_duration,
 )
+
+# NOTE: TEMP_DIR and INPUT_DIR are NOT imported by value — they're mutable
+# runtime paths that modal_app.py rebinds to a per-invocation tempdir. If we
+# `from .constants import TEMP_DIR`, the name is frozen to constants.py's
+# default (Path("temp")) at import time and Modal's rebind has no effect.
+# Access them through the module object instead so every read sees the
+# current value.
 from .fonts import bg_rgb, find_system_font, load_font, sanitize_render_text
 from .text_layout import JANOME_TOKENIZER, wrap_and_fit, wrap_text
 
@@ -88,9 +94,9 @@ def build_letterbox_filter(bg_color: str) -> str:
 # ──────────────────────────────────────────
 def scan_input_images() -> list[Path]:
     """Return sorted list of image files found in input/."""
-    if not INPUT_DIR.exists():
+    if not _const.INPUT_DIR.exists():
         return []
-    return sorted(p for p in INPUT_DIR.iterdir() if p.suffix.lower() in _IMAGE_EXTS)
+    return sorted(p for p in _const.INPUT_DIR.iterdir() if p.suffix.lower() in _IMAGE_EXTS)
 
 
 def fit_image_in_box(img_path: Path, box_w: int, box_h: int, bg: tuple) -> Image.Image:
@@ -701,7 +707,10 @@ def _prepare_story(
     srt_content = ""
     if add_captions:
         srt_content = build_story_srt(story["segments"], transcript_segs, durations)
-        srt_path = TEMP_DIR / f"{video_path.stem}_s{rank}.srt"
+        srt_path = _const.TEMP_DIR / f"{video_path.stem}_s{rank}.srt"
+        # Parent directory might not exist if caller rebound TEMP_DIR to a
+        # fresh tempdir without pre-creating it — mkdir guards against that.
+        srt_path.parent.mkdir(parents=True, exist_ok=True)
         srt_path.write_text(srt_content, encoding="utf-8")
 
     return joined_path, durations, srt_content
@@ -752,7 +761,7 @@ def render_all_stories(
     review_subtitles: bool = False,
 ) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    work_dir = TEMP_DIR / "render"
+    work_dir = _const.TEMP_DIR / "render"
     work_dir.mkdir(parents=True, exist_ok=True)
 
     info = get_video_info(video_path)
@@ -802,7 +811,7 @@ def render_all_stories(
         for story in stories:
             rank = story["rank"]
             if rank in prepared:
-                srt_path = TEMP_DIR / f"{video_path.stem}_s{rank}.srt"
+                srt_path = _const.TEMP_DIR / f"{video_path.stem}_s{rank}.srt"
                 print(f"   #{rank:2d}: {srt_path.resolve()}")
         print("\n   編集が完了したら Enter を押してください...")
         input()
@@ -816,7 +825,7 @@ def render_all_stories(
             out_path, joined_path, durations = prepared[rank]
             print(f"   #{rank:2d} {story['title'][:50]}...", end=" ", flush=True)
             try:
-                srt_path = TEMP_DIR / f"{video_path.stem}_s{rank}.srt"
+                srt_path = _const.TEMP_DIR / f"{video_path.stem}_s{rank}.srt"
                 srt_content = srt_path.read_text(encoding="utf-8") if srt_path.exists() else None
                 add_overlays(
                     joined_path, story, transcript_segs, durations,
@@ -861,7 +870,7 @@ def render_all_stories(
 # Cleanup
 # ──────────────────────────────────────────
 def cleanup_render_dir() -> None:
-    render_dir = TEMP_DIR / "render"
+    render_dir = _const.TEMP_DIR / "render"
     if render_dir.exists():
         shutil.rmtree(render_dir)
         print(f"   Removed {render_dir}/")

@@ -331,6 +331,207 @@ def extract_stories_job(
         raise
 
 
+# ── Helpers shared between prepare/render ────────────────────────────
+def _strip_video_extension(title: str) -> str:
+    """Strip trailing ``.mp4`` / ``.mkv`` / etc. from ``title``.
+
+    Shared between the render-only and prepare-subtitles paths so the
+    top-of-frame text never shows the extension. Strips surrounding
+    whitespace first so trailing spaces don't hide the extension from
+    the regex anchor.
+    """
+    t = (title or "").strip()
+    t = re.sub(
+        r"\.(mp4|mkv|mov|webm|avi|m4v|flv|wmv|mpg|mpeg|ts)$",
+        "", t, flags=re.IGNORECASE,
+    ).strip()
+    return t
+
+
+def _safe_output_stem(story: dict) -> str:
+    """Sanitize story title for use as the output filename stem.
+
+    Mirrors the logic inside ``render.render_story`` so the filenames
+    produced by the two-phase flow match the one-shot flow.
+    """
+    title = story.get("title", "")
+    safe = "".join(c if c.isalnum() or c in " -_" else "_" for c in title)
+    return safe[:50].strip() or f"story_{story.get('rank', 0)}"
+
+
+def _download_input_images(r2, constants_module) -> list:
+    """Download overlay images from ``jobs/<id>/input/`` into INPUT_DIR.
+
+    Returns a list of local ``Path`` s. Failures are logged and swallowed
+    — rendering can still proceed without user-supplied overlay images.
+    """
+    from pathlib import Path
+
+    image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    input_prefix = r2._key("input/")
+    images = []
+    try:
+        paginator = r2.s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(
+            Bucket=r2.bucket_name, Prefix=input_prefix
+        ):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                name = key.rsplit("/", 1)[-1]
+                if not name:
+                    continue
+                if Path(name).suffix.lower() not in image_exts:
+                    continue
+                dest = constants_module.INPUT_DIR / name
+                r2.s3.download_file(r2.bucket_name, key, str(dest))
+                images.append(dest)
+    except Exception as e:
+        print(f"[_download_input_images] No input images loaded: {e}")
+    return images
+
+
+# ── Job 2b-prep: Cut + join + SRT, then pause for user review ────────
+# This is the cloud equivalent of the CLI's --review-subtitles pause.
+# Only called when the user explicitly opts into subtitle editing via
+# the StoryEditor checkbox. Normal render (no checkbox) skips this and
+# calls render_videos_job directly against the raw source video.
+@app.function(
+    secrets=[secrets],
+    timeout=7200,   # 2 hours max
+    memory=8192,
+    cpu=4.0,
+)
+def prepare_subtitles_job(
+    job_id: str,
+    duration_preset: str = "30-60",
+    bg_color: str = "white",
+) -> dict:
+    """Phase 2b-prep: cut segments + join + generate SRT per story.
+
+    Uploads each joined intermediate video to R2 at
+    ``jobs/<id>/joined/s<rank>.mp4`` and stores the generated SRT plus
+    per-segment durations in ``stories.subtitles_json``. Flips the job
+    to ``awaiting_subtitle_review`` when done.
+
+    The follow-up :func:`render_videos_job` detects ``subtitles_json``
+    and skips back to Phase 2 (overlay only) using the (possibly edited)
+    SRT text from the DB.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from mkvideo.cloud.supabase_client import SupabaseJobClient
+    from mkvideo.pipeline.constants import DURATION_PRESETS, DURATION_TOLERANCE_SEC
+    from mkvideo.pipeline.render import _prepare_story
+    from mkvideo.storage.r2 import R2Storage
+
+    db = SupabaseJobClient()
+    r2 = R2Storage(prefix=f"jobs/{job_id}")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+
+            job = db.get_job(job_id)
+            if not job:
+                raise RuntimeError(f"Job {job_id} not found")
+
+            stories = db.get_stories(job_id)
+            if not stories:
+                raise RuntimeError("Stories not found — extraction must run first")
+
+            transcript_data = db.get_transcript(job_id)
+            if not transcript_data:
+                raise RuntimeError("Transcript not found")
+            transcript_segs = transcript_data["segments"]
+
+            db.update_job_status(job_id, "preparing_subtitles")
+            db.update_job_progress(
+                job_id, "preparing_subtitles",
+                current=0, total=len(stories),
+                detail="Downloading source video...",
+            )
+            video_path = _download_video_from_r2(r2, job_id, tmp)
+
+            # _prepare_story uses constants.TEMP_DIR for SRT dumps.
+            import mkvideo.pipeline.constants as constants
+            constants.TEMP_DIR = tmp / "temp"
+            constants.TEMP_DIR.mkdir()
+            work_dir = tmp / "work"
+            work_dir.mkdir()
+
+            _, max_dur = DURATION_PRESETS.get(duration_preset, (30, 60))
+            max_total = max_dur + DURATION_TOLERANCE_SEC
+
+            subtitles: dict[str, dict] = {}
+            # Collect per-story failures so we can surface them to the user
+            # rather than hiding them behind a generic "no stories prepared"
+            # error. Each entry is "#<rank>: <ExceptionType>: <message>".
+            errors: list[str] = []
+            for i, story in enumerate(stories):
+                rank = story["rank"]
+                db.update_job_progress(
+                    job_id, "preparing_subtitles",
+                    current=i, total=len(stories),
+                    detail=f"Preparing subtitles for story #{rank}",
+                )
+                try:
+                    joined_path, durations, srt_content = _prepare_story(
+                        story, video_path, transcript_segs, work_dir,
+                        bg_color, True, max_total,
+                    )
+                except Exception as e:
+                    # Skip stories that fail to cut/join rather than aborting
+                    # the whole batch — the user can still review & render the
+                    # stories that succeeded. Capture full traceback for Modal
+                    # logs and a short summary for the UI/DB.
+                    import traceback
+                    tb = traceback.format_exc()
+                    print(
+                        f"[prepare_subtitles_job] story #{rank} failed:\n{tb}",
+                        flush=True,
+                    )
+                    errors.append(f"#{rank}: {type(e).__name__}: {e}")
+                    continue
+
+                joined_key = f"joined/s{rank}.mp4"
+                r2.save_file(joined_path, joined_key)
+
+                subtitles[str(rank)] = {
+                    "srt": srt_content,
+                    "durations": list(durations),
+                    "joined_key": joined_key,
+                }
+
+            if not subtitles:
+                # Surface the real errors — the whole reason we collect them.
+                # Cap length because Supabase error_message is a text column
+                # and we don't want to dump a novel into the UI.
+                summary = "; ".join(errors) if errors else "(no errors captured)"
+                if len(summary) > 800:
+                    summary = summary[:800] + "…"
+                raise RuntimeError(
+                    f"No stories could be prepared for subtitle review. "
+                    f"Failures: {summary}"
+                )
+
+            db.save_subtitles(job_id, subtitles)
+            db.update_job_status(
+                job_id, "awaiting_subtitle_review",
+                progress={
+                    "step": "awaiting_subtitle_review",
+                    "current": len(subtitles),
+                    "total": len(stories),
+                    "detail": "Subtitles ready for review",
+                },
+            )
+            return {"job_id": job_id, "prepared": len(subtitles)}
+
+    except Exception as e:
+        db.update_job_status(job_id, "failed", error_message=str(e))
+        raise
+
+
 # ── Job 2b: Render videos (heavy ffmpeg work) ────────────────────────
 @app.function(
     secrets=[secrets],
@@ -346,9 +547,17 @@ def render_videos_job(
 ) -> dict:
     """Phase 2b: Render all short videos from stories saved in Supabase.
 
-    Called after the user approves (and possibly edits) the extracted
-    stories. Reads the latest ``stories_json`` from Supabase so any
-    edits from the StoryEditor are applied.
+    Two modes, selected by the presence of ``stories.subtitles_json``:
+
+    - **Phase-2-only mode** (subtitles_json present): the user went
+      through the subtitle review step, so we download the already-joined
+      intermediate video from R2 and overlay the (possibly edited) SRT
+      + title + images. Source video is NOT re-downloaded.
+    - **Full mode** (no subtitles_json): legacy / default single-shot
+      flow — download source video, run ``render_all_stories`` which
+      cuts, joins, generates SRT, and overlays in one pass.
+
+    Always reads the latest ``stories_json`` so StoryEditor edits apply.
     """
     import tempfile
     from pathlib import Path
@@ -356,6 +565,7 @@ def render_videos_job(
     from mkvideo.cloud.supabase_client import SupabaseJobClient
     from mkvideo.pipeline.constants import DURATION_PRESETS
     from mkvideo.pipeline.render import (
+        add_overlays,
         get_clip_duration,
         render_all_stories,
     )
@@ -386,64 +596,90 @@ def render_videos_job(
                 "segments": transcript_data["segments"],
             }
 
-            db.update_job_status(job_id, "rendering")
-            video_path = _download_video_from_r2(r2, job_id, tmp)
+            subtitles = db.get_subtitles(job_id)
 
-            # Override TEMP_DIR / INPUT_DIR for ephemeral container work
+            # Override TEMP_DIR / INPUT_DIR for ephemeral container work.
+            # Both modes need these: render_all_stories writes SRT to
+            # TEMP_DIR, add_overlays reads overlay images from INPUT_DIR.
             import mkvideo.pipeline.constants as constants
             constants.TEMP_DIR = tmp / "temp"
             constants.TEMP_DIR.mkdir()
             constants.INPUT_DIR = tmp / "input"
             constants.INPUT_DIR.mkdir()
 
-            # Download overlay images (optional) from R2 jobs/{id}/input/
-            input_images = []
-            _image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-            input_prefix = r2._key("input/")
-            try:
-                paginator = r2.s3.get_paginator("list_objects_v2")
-                for page in paginator.paginate(
-                    Bucket=r2.bucket_name, Prefix=input_prefix
-                ):
-                    for obj in page.get("Contents", []):
-                        key = obj["Key"]
-                        name = key.rsplit("/", 1)[-1]
-                        if not name:
-                            continue
-                        if Path(name).suffix.lower() not in _image_exts:
-                            continue
-                        dest = constants.INPUT_DIR / name
-                        r2.s3.download_file(r2.bucket_name, key, str(dest))
-                        input_images.append(dest)
-            except Exception as e:
-                print(f"[render_videos_job] No input images loaded: {e}")
+            input_images = _download_input_images(r2, constants)
             if input_images:
                 print(f"[render_videos_job] Loaded {len(input_images)} overlay images")
 
             _, max_dur = DURATION_PRESETS.get(duration_preset, (30, 60))
-            # Strip video file extensions so they don't end up burnt into
-            # the top-of-frame title text. The frontend already does this
-            # for new uploads, but legacy jobs and YouTube URLs may still
-            # carry an extension through to render time. Strip whitespace
-            # first so trailing spaces don't hide the extension from the
-            # regex anchor.
-            video_title = job.get("video_title", job.get("youtube_url", "")).strip()
-            video_title = re.sub(
-                r"\.(mp4|mkv|mov|webm|avi|m4v|flv|wmv|mpg|mpeg|ts)$",
-                "",
-                video_title,
-                flags=re.IGNORECASE,
-            ).strip()
-
-            output_paths = render_all_stories(
-                video_path, stories, transcript, out_dir,
-                max_duration=max_dur,
-                bg_color=bg_color,
-                add_captions=add_captions,
-                input_images=input_images,
-                video_title=video_title,
+            video_title = _strip_video_extension(
+                job.get("video_title", job.get("youtube_url", ""))
             )
 
+            db.update_job_status(job_id, "rendering")
+
+            output_paths: list[Path] = []
+
+            if subtitles:
+                # ── Phase-2-only mode ────────────────────────────────
+                # Joined videos are already in R2 from prepare_subtitles_job;
+                # SRTs are in subtitles[<rank>]["srt"] and may have been
+                # edited by the user in the web UI.
+                work_dir = tmp / "work"
+                work_dir.mkdir()
+
+                for i, story in enumerate(stories):
+                    rank = story["rank"]
+                    sub = subtitles.get(str(rank))
+                    if not sub:
+                        # Story was skipped during prepare (e.g. ffmpeg
+                        # failed on Phase 1). Nothing to render.
+                        continue
+
+                    db.update_job_progress(
+                        job_id, "rendering",
+                        current=i, total=len(stories),
+                        detail=f"Rendering story #{rank} (overlay)",
+                    )
+
+                    joined_local = work_dir / f"s{rank}_joined.mp4"
+                    joined_full_key = r2._key(sub["joined_key"])
+                    r2.s3.download_file(
+                        r2.bucket_name, joined_full_key, str(joined_local)
+                    )
+
+                    out_path = (
+                        out_dir / f"{rank:02d}_{_safe_output_stem(story)}.mp4"
+                    )
+                    srt_content = sub.get("srt") or None
+                    durations = [float(d) for d in sub.get("durations") or []]
+
+                    try:
+                        add_overlays(
+                            joined_local, story, transcript["segments"],
+                            durations, work_dir, out_path,
+                            bg_color, add_captions, input_images, video_title,
+                            srt_content=srt_content,
+                        )
+                    except Exception as e:
+                        print(f"[render_videos_job] story #{rank} overlay failed: {e}")
+                        continue
+
+                    output_paths.append(out_path)
+
+            else:
+                # ── Full mode (legacy single-shot) ──────────────────
+                video_path = _download_video_from_r2(r2, job_id, tmp)
+                output_paths = render_all_stories(
+                    video_path, stories, transcript, out_dir,
+                    max_duration=max_dur,
+                    bg_color=bg_color,
+                    add_captions=add_captions,
+                    input_images=input_images,
+                    video_title=video_title,
+                )
+
+            # ── Upload results + record in DB ────────────────────────
             for path in output_paths:
                 r2_key = f"output/{path.name}"
                 r2.save_file(path, r2_key)
@@ -536,6 +772,19 @@ def api():
         bg_color: str = "white"
         add_captions: bool = True
 
+    class StartPrepareSubtitlesRequest(BaseModel):
+        """Phase 2b-prep: run cut + join + SRT, pause for subtitle review.
+
+        Only called when the user opted into --review-subtitles-equivalent
+        behavior via the StoryEditor checkbox. ``bg_color`` and
+        ``duration_preset`` are needed because the joined intermediate
+        already has the background applied and must match what the final
+        render step will overlay onto.
+        """
+        job_id: str
+        duration_preset: str = "30-60"
+        bg_color: str = "white"
+
     class UploadUrlRequest(BaseModel):
         job_id: str
         filename: str
@@ -595,12 +844,32 @@ def api():
 
     @web_app.post("/start-render")
     async def start_render(req: StartRenderRequest):
-        """Start Phase 2b: render videos from (possibly edited) stories."""
+        """Start Phase 2b: render videos from (possibly edited) stories.
+
+        If ``stories.subtitles_json`` exists (populated by
+        ``/start-prepare-subtitles``), render_videos_job skips cutting
+        and only overlays the stored SRT — the user's edits from the
+        SubtitleEditor are picked up from the DB.
+        """
         call = await render_videos_job.spawn.aio(
             job_id=req.job_id,
             duration_preset=req.duration_preset,
             bg_color=req.bg_color,
             add_captions=req.add_captions,
+        )
+        return {"call_id": call.object_id, "job_id": req.job_id}
+
+    @web_app.post("/start-prepare-subtitles")
+    async def start_prepare_subtitles(req: StartPrepareSubtitlesRequest):
+        """Kick off the prepare-subtitles phase (cut + join + SRT).
+
+        Flips the job to ``preparing_subtitles`` → ``awaiting_subtitle_review``
+        so the frontend can open the SubtitleEditor.
+        """
+        call = await prepare_subtitles_job.spawn.aio(
+            job_id=req.job_id,
+            duration_preset=req.duration_preset,
+            bg_color=req.bg_color,
         )
         return {"call_id": call.object_id, "job_id": req.job_id}
 

@@ -18,17 +18,21 @@ const STEP_LABELS: Record<string, string> = {
   awaiting_review: "Waiting for transcript review",
   extracting: "Extracting stories with AI",
   awaiting_story_review: "Waiting for story review",
+  preparing_subtitles: "Cutting segments & generating subtitles",
+  awaiting_subtitle_review: "Waiting for subtitle review",
   rendering: "Rendering short videos",
   complete: "Complete!",
   failed: "Failed",
 };
 
 // Status values that require fetching server-side data we don't have on
-// the client yet (transcript, stories, output videos). When we transition
-// into one of these, refresh the server component to pull them in.
+// the client yet (transcript, stories, subtitles, output videos). When we
+// transition into one of these, refresh the server component to pull
+// them in.
 const REFRESH_ON = new Set([
   "awaiting_review",
   "awaiting_story_review",
+  "awaiting_subtitle_review",
   "complete",
   "failed",
 ]);
@@ -138,7 +142,14 @@ export default function ProgressDisplay({
     progress.total && progress.total > 0
       ? Math.round(((progress.current || 0) / progress.total) * 100)
       : 0;
-  const isRunning = !["complete", "failed", "awaiting_review", "awaiting_story_review", "pending"].includes(status);
+  const isRunning = ![
+    "complete",
+    "failed",
+    "awaiting_review",
+    "awaiting_story_review",
+    "awaiting_subtitle_review",
+    "pending",
+  ].includes(status);
 
   return (
     <div className="bg-white border border-gray-200 rounded-lg p-5">

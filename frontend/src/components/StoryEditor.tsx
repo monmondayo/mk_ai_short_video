@@ -48,17 +48,23 @@ export default function StoryEditor({
   jobId,
   stories: initialStories,
   onSave,
+  onSaveAndPrepareSubtitles,
 }: {
   jobId: string;
   stories: Story[];
   /** Called after stories are persisted. May return a Promise to keep
    *  the button in its loading state until rendering has kicked off. */
   onSave?: () => void | Promise<void>;
+  /** Called after stories are persisted when the user opted to review
+   *  subtitles (prepare phase). If omitted, the checkbox is hidden. */
+  onSaveAndPrepareSubtitles?: () => void | Promise<void>;
 }) {
   const supabase = createClient();
   const [stories, setStories] = useState<Story[]>(initialStories);
   const [saving, setSaving] = useState(false);
   const [continuing, setContinuing] = useState(false);
+  const [preparing, setPreparing] = useState(false);
+  const [reviewSubtitles, setReviewSubtitles] = useState(false);
   const [saved, setSaved] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -125,7 +131,28 @@ export default function StoryEditor({
     }
   };
 
-  const busy = saving || continuing;
+  const handleSaveAndPrepareSubtitles = async () => {
+    if (!onSaveAndPrepareSubtitles) return;
+    setPreparing(true);
+    setErrorMsg(null);
+    try {
+      const ok = await persist();
+      if (!ok) {
+        setPreparing(false);
+        return;
+      }
+      setSaved(true);
+      await onSaveAndPrepareSubtitles();
+      // Parent router.refresh() will unmount this component shortly.
+    } catch (e) {
+      setErrorMsg(
+        e instanceof Error ? e.message : "Failed to start subtitle prep",
+      );
+      setPreparing(false);
+    }
+  };
+
+  const busy = saving || continuing || preparing;
 
   return (
     <div className="space-y-3">
@@ -142,7 +169,7 @@ export default function StoryEditor({
           >
             {saving ? "Saving..." : "Save"}
           </button>
-          {onSave && (
+          {onSave && !reviewSubtitles && (
             <button
               onClick={handleSaveAndRender}
               disabled={busy}
@@ -154,8 +181,37 @@ export default function StoryEditor({
               {continuing ? "Starting render..." : "Save & Render"}
             </button>
           )}
+          {onSaveAndPrepareSubtitles && reviewSubtitles && (
+            <button
+              onClick={handleSaveAndPrepareSubtitles}
+              disabled={busy}
+              className="px-4 py-1.5 bg-purple-600 text-white rounded-lg text-sm font-medium hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-2"
+            >
+              {preparing && (
+                <span className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+              )}
+              {preparing ? "Preparing subtitles..." : "Save & Prepare Subtitles"}
+            </button>
+          )}
         </div>
       </div>
+
+      {onSaveAndPrepareSubtitles && (
+        <label className="flex items-center gap-2 text-sm text-gray-700 bg-purple-50 border border-purple-200 rounded-lg px-3 py-2 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={reviewSubtitles}
+            onChange={(e) => setReviewSubtitles(e.target.checked)}
+            disabled={busy}
+            className="rounded"
+          />
+          <span>
+            <strong>字幕を編集してから描画</strong>
+            （ローカル CLI の <code className="text-xs bg-white px-1 py-0.5 rounded border">--review-subtitles</code> と同等）
+            — ストーリーをカット・結合・SRT 生成した後に一時停止し、字幕を編集してから最終レンダリングします。
+          </span>
+        </label>
+      )}
 
       <p className="text-sm text-gray-500">
         <strong>タイトル</strong> はダッシュボード表示、<strong>フック</strong>{" "}

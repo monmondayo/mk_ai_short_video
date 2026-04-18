@@ -3,9 +3,16 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase-browser";
-import { startExtract, startRender } from "@/lib/modal-api";
+import {
+  startExtract,
+  startPrepareSubtitles,
+  startRender,
+} from "@/lib/modal-api";
 import TranscriptEditor from "@/components/TranscriptEditor";
 import StoryEditor, { type Story } from "@/components/StoryEditor";
+import SubtitleEditor, {
+  type SubtitlesPayload,
+} from "@/components/SubtitleEditor";
 import ProgressDisplay from "@/components/ProgressDisplay";
 import VideoResults from "@/components/VideoResults";
 
@@ -40,11 +47,15 @@ export default function JobDetailClient({
   job,
   transcript,
   stories,
+  subtitles,
   videos,
 }: {
   job: Job;
   transcript: Transcript;
   stories: Story[] | null;
+  /** Per-story SRT blob from stories.subtitles_json — present only when
+   *  the user opted into subtitle review (null otherwise). */
+  subtitles: SubtitlesPayload | null;
   videos: OutputVideo[];
 }) {
   const router = useRouter();
@@ -74,7 +85,11 @@ export default function JobDetailClient({
     }
   };
 
-  /** Phase 2b: after story review → kick off ffmpeg rendering. */
+  /** Phase 2b: after story review → kick off ffmpeg rendering.
+   *
+   *  If ``subtitles_json`` exists on the stories row, render_videos_job
+   *  on Modal detects it and only overlays (skipping cut+join). From
+   *  the frontend's perspective we just call /start-render either way. */
   const handleStartRender = async () => {
     setError("");
     try {
@@ -98,12 +113,40 @@ export default function JobDetailClient({
     }
   };
 
+  /** Phase 2b-prep: after story review → cut + join + SRT (pause for
+   *  subtitle review). Only triggered when the user checks
+   *  「字幕を編集してから描画」in the StoryEditor. */
+  const handleStartPrepareSubtitles = async () => {
+    setError("");
+    try {
+      const { call_id } = await startPrepareSubtitles({
+        job_id: job.id,
+        duration_preset: job.duration_preset,
+        bg_color: job.bg_color,
+      });
+
+      await supabase
+        .from("jobs")
+        .update({ modal_call_id: call_id, status: "preparing_subtitles" })
+        .eq("id", job.id);
+
+      router.refresh();
+    } catch (err) {
+      const msg = err instanceof Error
+        ? err.message
+        : "Failed to start subtitle preparation";
+      setError(msg);
+      throw err;
+    }
+  };
+
   const isProcessing = [
     "uploading",
     "downloading",
     "transcribing",
     "proofreading",
     "extracting",
+    "preparing_subtitles",
     "rendering",
   ].includes(job.status);
 
@@ -112,6 +155,13 @@ export default function JobDetailClient({
 
   const showStories =
     job.status === "awaiting_story_review" && stories && stories.length > 0;
+
+  const showSubtitles =
+    job.status === "awaiting_subtitle_review" &&
+    stories &&
+    stories.length > 0 &&
+    subtitles &&
+    Object.keys(subtitles).length > 0;
 
   return (
     <div className="space-y-6">
@@ -188,12 +238,41 @@ export default function JobDetailClient({
             <p className="text-sm text-amber-800">
               Stories extracted. Review and edit titles and hooks below,
               then click <strong>&quot;Save &amp; Render&quot;</strong> to
-              produce the short videos.
+              produce the short videos (or enable subtitle review to edit
+              captions after cutting).
             </p>
           </div>
           <StoryEditor
             jobId={job.id}
             stories={stories!}
+            onSave={handleStartRender}
+            onSaveAndPrepareSubtitles={handleStartPrepareSubtitles}
+          />
+          {error && (
+            <p className="text-sm text-red-600 bg-red-50 px-3 py-2 rounded">
+              {error}
+            </p>
+          )}
+        </>
+      )}
+
+      {/* Subtitle Editor (shown when awaiting subtitle review) */}
+      {showSubtitles && (
+        <>
+          <div className="bg-purple-50 border border-purple-200 rounded-lg p-4">
+            <p className="text-sm text-purple-800">
+              Subtitles prepared. Review and edit each story&apos;s SRT
+              below, then click <strong>&quot;Save &amp; Render&quot;</strong>
+              {" "}to produce the final short videos.
+            </p>
+          </div>
+          <SubtitleEditor
+            jobId={job.id}
+            stories={stories!.map((s) => ({
+              rank: s.rank,
+              title: s.title,
+            }))}
+            subtitles={subtitles!}
             onSave={handleStartRender}
           />
           {error && (

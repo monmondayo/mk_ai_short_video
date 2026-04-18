@@ -195,6 +195,45 @@ class SupabaseJobClient:
             return None
         return rows[0].get("stories_json")
 
+    # ── Subtitle operations ───────────────────────────────────────────
+    # ``subtitles_json`` on the stories row mirrors the CLI's
+    # --review-subtitles intermediate state: after Phase 1 cuts + joins
+    # + generates SRTs we stash them here so the browser can edit them.
+
+    def save_subtitles(self, job_id: str, subtitles_json: dict) -> None:
+        """Upsert the subtitles_json blob for a job.
+
+        ``subtitles_json`` is keyed by rank-as-string::
+
+            {
+              "1": {
+                "srt": "1\\n00:00:00,000 --> ...\\n...",
+                "durations": [10.5, 8.2],
+                "joined_key": "joined/s1.mp4"
+              },
+              ...
+            }
+
+        We always update the existing stories row (extract_stories_job
+        creates it), so no fallback insert is needed.
+        """
+        self._patch(
+            "stories",
+            {"job_id": job_id},
+            {"subtitles_json": subtitles_json},
+        )
+
+    def get_subtitles(self, job_id: str) -> dict | None:
+        """Return the ``subtitles_json`` blob for this job, or None."""
+        url = self._rest_url("stories")
+        params = {"job_id": f"eq.{job_id}", "select": "subtitles_json"}
+        resp = requests.get(url, headers=self.headers, params=params)
+        resp.raise_for_status()
+        rows = resp.json()
+        if not rows:
+            return None
+        return rows[0].get("subtitles_json")
+
     # ── Output video operations ───────────────────────────────────────
 
     def save_output_video(
