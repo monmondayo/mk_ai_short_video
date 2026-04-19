@@ -168,6 +168,20 @@ create policy "Users can view own stories"
         where jobs.id = stories.job_id and jobs.user_id = auth.uid()
     ));
 
+-- UPDATE policy is required so the browser-side StoryEditor and
+-- SubtitleEditor can persist edits. Without it RLS silently drops the
+-- update (0 rows affected, no error) and the user's changes disappear.
+create policy "Users can update own stories"
+    on public.stories for update
+    using (exists (
+        select 1 from public.jobs
+        where jobs.id = stories.job_id and jobs.user_id = auth.uid()
+    ))
+    with check (exists (
+        select 1 from public.jobs
+        where jobs.id = stories.job_id and jobs.user_id = auth.uid()
+    ));
+
 -- Output Videos
 create policy "Users can view own output videos"
     on public.output_videos for select
