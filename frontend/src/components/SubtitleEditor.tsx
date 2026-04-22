@@ -77,12 +77,23 @@ export default function SubtitleEditor({
   };
 
   const persist = async (): Promise<boolean> => {
-    const { error } = await supabase
+    // .select() returns the updated rows — if RLS blocks the update it
+    // yields an empty array instead of an error, so we check length to
+    // catch silent failures. Without this, a missing UPDATE policy would
+    // leave the UI showing "Saved" while the DB stayed unchanged.
+    const { data, error } = await supabase
       .from("stories")
       .update({ subtitles_json: subtitles })
-      .eq("job_id", jobId);
+      .eq("job_id", jobId)
+      .select("id");
     if (error) {
       setErrorMsg(`Save failed: ${error.message}`);
+      return false;
+    }
+    if (!data || data.length === 0) {
+      setErrorMsg(
+        "Save failed: no rows updated (check Supabase RLS UPDATE policy on stories)",
+      );
       return false;
     }
     return true;

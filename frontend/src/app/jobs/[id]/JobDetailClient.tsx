@@ -15,6 +15,7 @@ import SubtitleEditor, {
 } from "@/components/SubtitleEditor";
 import ProgressDisplay from "@/components/ProgressDisplay";
 import VideoResults from "@/components/VideoResults";
+import PhaseReverter from "@/components/PhaseReverter";
 
 type Job = {
   id: string;
@@ -289,6 +290,21 @@ export default function JobDetailClient({
           videos={videos}
           modalApiUrl={process.env.NEXT_PUBLIC_MODAL_API_URL || ""}
           jobId={job.id}
+        />
+      )}
+
+      {/* Phase Reverter — let the user jump back to an earlier review
+          phase (transcript / stories / subtitles) without re-uploading
+          the source video. Only safe to show while the job is NOT
+          currently being worked on by Modal — otherwise we'd race the
+          worker's own status writes. */}
+      {!isProcessing && (
+        <PhaseReverter
+          jobId={job.id}
+          currentStatus={job.status}
+          hasTranscript={!!transcript?.segments?.length}
+          hasStories={!!(stories && stories.length > 0)}
+          hasSubtitles={!!(subtitles && Object.keys(subtitles).length > 0)}
         />
       )}
 

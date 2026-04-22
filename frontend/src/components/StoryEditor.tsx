@@ -93,12 +93,22 @@ export default function StoryEditor({
   };
 
   const persist = async (): Promise<boolean> => {
-    const { error } = await supabase
+    // .select() so we can distinguish "RLS blocked the update" (empty
+    // array, no error) from a real success. Without this the UI would
+    // show "Saved" while the DB stayed unchanged.
+    const { data, error } = await supabase
       .from("stories")
       .update({ stories_json: stories })
-      .eq("job_id", jobId);
+      .eq("job_id", jobId)
+      .select("id");
     if (error) {
       setErrorMsg(`Save failed: ${error.message}`);
+      return false;
+    }
+    if (!data || data.length === 0) {
+      setErrorMsg(
+        "Save failed: no rows updated (check Supabase RLS UPDATE policy on stories)",
+      );
       return false;
     }
     return true;
