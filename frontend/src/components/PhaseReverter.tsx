@@ -113,6 +113,12 @@ export default function PhaseReverter({
       router.refresh();
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : "Failed to revert phase");
+    } finally {
+      // Always clear the busy state — otherwise a successful revert leaves
+      // `reverting` stuck on the just-completed phase, and every other
+      // phase button stays disabled (via `busy = reverting !== null`) until
+      // a full page reload. router.refresh() re-fetches server data but
+      // does NOT unmount this component, so useState is preserved.
       setReverting(null);
     }
   };
