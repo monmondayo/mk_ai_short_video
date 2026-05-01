@@ -41,6 +41,76 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_DIR / ".env")
 
 
+def format_bytes(num_bytes: int) -> str:
+    """Format bytes into a human-readable IEC string."""
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(num_bytes)
+    idx = 0
+    while value >= 1024 and idx < len(units) - 1:
+        value /= 1024
+        idx += 1
+    return f"{value:.2f} {units[idx]}"
+
+
+def check_r2_usage(r2_prefix: str, free_limit_gb: float) -> int:
+    """Print Cloudflare R2 usage and return process exit code."""
+    try:
+        from .storage.r2 import R2Storage
+    except ModuleNotFoundError as exc:
+        if exc.name == "boto3":
+            print("[R2 Usage] Missing dependency: boto3")
+            print("Install cloud dependencies first:")
+            print("  pip install -r requirements-cloud.txt")
+            return 1
+        raise
+
+    prefix = r2_prefix.strip("/")
+    r2 = R2Storage(prefix=prefix)
+
+    request_prefix = f"{prefix}/" if prefix else ""
+    total_bytes = 0
+    total_objects = 0
+    continuation_token = None
+
+    print("\n[R2 Usage] Collecting storage usage...")
+    print(f"   Bucket: {r2.bucket_name}")
+    print(f"   Prefix: {request_prefix or '(all objects)'}")
+
+    while True:
+        params = {"Bucket": r2.bucket_name, "MaxKeys": 1000}
+        if request_prefix:
+            params["Prefix"] = request_prefix
+        if continuation_token:
+            params["ContinuationToken"] = continuation_token
+
+        response = r2.s3.list_objects_v2(**params)
+        for obj in response.get("Contents", []):
+            total_objects += 1
+            total_bytes += int(obj.get("Size", 0))
+
+        if not response.get("IsTruncated"):
+            break
+        continuation_token = response.get("NextContinuationToken")
+
+    free_limit_bytes = int(free_limit_gb * 1_000_000_000)
+    usage_percent = (total_bytes / free_limit_bytes * 100) if free_limit_bytes > 0 else 0.0
+    remaining_bytes = free_limit_bytes - total_bytes
+    is_within_limit = total_bytes <= free_limit_bytes
+
+    print("\n[R2 Usage] Result")
+    print(f"   Objects: {total_objects:,}")
+    print(f"   Used:    {total_bytes:,} bytes ({format_bytes(total_bytes)})")
+    print(f"   Limit:   {free_limit_bytes:,} bytes ({free_limit_gb:.2f} GB)")
+    print(f"   Usage:   {usage_percent:.2f}%")
+
+    if is_within_limit:
+        print(f"   Status:  OK (remaining {remaining_bytes:,} bytes / {format_bytes(max(remaining_bytes, 0))})")
+        return 0
+
+    print(f"   Status:  OVER LIMIT by {abs(remaining_bytes):,} bytes / {format_bytes(abs(remaining_bytes))}")
+    return 2
+
+
 def cache_token(value: str | None) -> str:
     if not value:
         return "auto"
@@ -51,7 +121,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Turn a long YouTube video into story-based short videos."
     )
-    parser.add_argument("url", help="YouTube video URL")
+    parser.add_argument("url", nargs="?", help="YouTube video URL")
     parser.add_argument("-n", "--num-stories", type=int, default=DEFAULT_NUM_STORIES,
                         help=f"Number of short videos to generate (default: {DEFAULT_NUM_STORIES})")
     parser.add_argument("--duration", default="30-60",
@@ -74,7 +144,19 @@ def main():
                         help="Skip subtitle overlay (upper hook text is always shown)")
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--skip-download", metavar="VIDEO_PATH")
+    parser.add_argument("--check-r2-usage", action="store_true",
+                        help="Check Cloudflare R2 bucket usage against a free-tier limit and exit")
+    parser.add_argument("--r2-prefix", default="",
+                        help="Optional R2 key prefix to limit usage scan (default: entire bucket)")
+    parser.add_argument("--free-limit-gb", type=float, default=10.0,
+                        help="Free-tier limit in GB for usage check (default: 10.0)")
     args = parser.parse_args()
+
+    if args.check_r2_usage:
+        return check_r2_usage(args.r2_prefix, args.free_limit_gb)
+
+    if not args.url:
+        parser.error("url is required unless --check-r2-usage is used")
 
     out_dir = Path(args.output_dir)
     TEMP_DIR.mkdir(exist_ok=True)
@@ -184,4 +266,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

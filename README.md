@@ -75,7 +75,15 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 # Claude 校正をスキップ (Whisper の素の出力を使用)
 ./run.sh "https://..." --no-proofread
+
+# Cloudflare R2 の容量確認 (10GB 無料枠チェック)
+./run.sh --check-r2-usage
+
+# 特定プレフィックス配下のみ確認 (例: jobs/)
+./run.sh --check-r2-usage --r2-prefix jobs
 ```
+
+> `--check-r2-usage` は `boto3` を使用するため、未導入の場合は `pip install -r requirements-cloud.txt` を先に実行してください。
 
 > `run.sh` は `python -m mkvideo` を conda 環境で呼ぶラッパーです。conda 以外を使う場合は直接 `python -m mkvideo <url> ...` を実行してください。
 
@@ -95,6 +103,9 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 | `--no-captions` | off | 下部字幕オーバーレイを無効化 |
 | `--output-dir` | `output` | 出力ディレクトリ |
 | `--skip-download` | — | ローカル動画パスを指定してダウンロードをスキップ |
+| `--check-r2-usage` | off | Cloudflare R2 容量を集計して無料枠判定して終了 |
+| `--r2-prefix` | 空 | 容量集計対象を特定プレフィックス配下に限定 |
+| `--free-limit-gb` | `10.0` | 無料枠判定に使う上限 GB 値 |
 
 ### Whisper モデル選択ガイド
 
