@@ -126,3 +126,27 @@ export async function deleteR2Files(jobId: string): Promise<{ deleted: number }>
   if (!res.ok) throw new Error(`delete-r2-files failed: ${res.statusText}`);
   return res.json();
 }
+
+export interface R2UsageResult {
+  bucket: string;
+  total_bytes: number;
+  total_objects: number;
+  free_limit_bytes: number;
+  usage_percent: number;
+}
+
+/**
+ * Fetch the current Cloudflare R2 bucket usage from the Modal API.
+ * The response contains total bytes, object count, and usage % vs. the
+ * 10 GB free-tier limit.
+ *
+ * Pass `{ cache: "no-store" }` when you need fresh data on every request
+ * (e.g. dashboard server component). Uses Next.js default ISR otherwise.
+ */
+export async function fetchR2Usage(
+  options?: RequestInit,
+): Promise<R2UsageResult> {
+  const res = await fetch(`${MODAL_API_URL}/r2-usage`, options);
+  if (!res.ok) throw new Error(`r2-usage failed: ${res.statusText}`);
+  return res.json();
+}

@@ -987,4 +987,32 @@ def api():
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
+    @web_app.get("/r2-usage")
+    async def r2_usage():
+        """Return R2 bucket usage: total bytes, object count, and free-tier percent.
+
+        Paginates through all objects in the bucket (not scoped to a job prefix)
+        so the dashboard can show overall storage consumption.
+        """
+        from mkvideo.storage.r2 import R2Storage
+
+        r2 = R2Storage(prefix="")
+        paginator = r2.s3.get_paginator("list_objects_v2")
+        total_bytes = 0
+        total_objects = 0
+        for page in paginator.paginate(Bucket=r2.bucket_name):
+            for obj in page.get("Contents", []):
+                total_objects += 1
+                total_bytes += int(obj.get("Size", 0))
+
+        free_limit_bytes = 10_000_000_000  # Cloudflare R2 free tier: 10 GB
+        usage_percent = round(total_bytes / free_limit_bytes * 100, 2) if free_limit_bytes else 0.0
+        return {
+            "bucket": r2.bucket_name,
+            "total_bytes": total_bytes,
+            "total_objects": total_objects,
+            "free_limit_bytes": free_limit_bytes,
+            "usage_percent": usage_percent,
+        }
+
     return web_app
