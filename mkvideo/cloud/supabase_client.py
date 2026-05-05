@@ -93,6 +93,10 @@ class SupabaseJobClient:
         num_stories: int = 10,
         duration_preset: str = "30-60",
         bg_color: str = "white",
+        upper_text_color: str = "#000000",
+        upper_edge_color: str = "#FFDC00",
+        subtitle_text_color: str = "#FFFFFF",
+        subtitle_edge_color: str = "#FF1493",
         add_captions: bool = True,
         skip_proofread: bool = False,
     ) -> dict:
@@ -106,6 +110,10 @@ class SupabaseJobClient:
             "num_stories": num_stories,
             "duration_preset": duration_preset,
             "bg_color": bg_color,
+            "upper_text_color": upper_text_color,
+            "upper_edge_color": upper_edge_color,
+            "subtitle_text_color": subtitle_text_color,
+            "subtitle_edge_color": subtitle_edge_color,
             "add_captions": add_captions,
             "skip_proofread": skip_proofread,
         }

@@ -42,6 +42,10 @@ export default function NewJobPage() {
   const [whisperModel, setWhisperModel] = useState("medium");
   const [whisperLang, setWhisperLang] = useState("ja");
   const [bgColor, setBgColor] = useState("white");
+  const [upperTextColor, setUpperTextColor] = useState("#000000");
+  const [upperEdgeColor, setUpperEdgeColor] = useState("#ffdc00");
+  const [subtitleTextColor, setSubtitleTextColor] = useState("#ffffff");
+  const [subtitleEdgeColor, setSubtitleEdgeColor] = useState("#ff1493");
   const [addCaptions, setAddCaptions] = useState(true);
   const [skipProofread, setSkipProofread] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -89,6 +93,10 @@ export default function NewJobPage() {
           num_stories: numStories,
           duration_preset: duration,
           bg_color: bgColor,
+          upper_text_color: upperTextColor,
+          upper_edge_color: upperEdgeColor,
+          subtitle_text_color: subtitleTextColor,
+          subtitle_edge_color: subtitleEdgeColor,
           add_captions: addCaptions,
           skip_proofread: skipProofread,
           status: "uploading",
@@ -393,6 +401,58 @@ export default function NewJobPage() {
                 <option value="white">White</option>
                 <option value="black">Black</option>
               </select>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Upper text color
+              </label>
+              <input
+                type="color"
+                value={upperTextColor}
+                onChange={(e) => setUpperTextColor(e.target.value)}
+                className="w-full h-10 px-1 py-1 border border-gray-300 rounded-lg"
+                title="Upper text color"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Upper edge color
+              </label>
+              <input
+                type="color"
+                value={upperEdgeColor}
+                onChange={(e) => setUpperEdgeColor(e.target.value)}
+                className="w-full h-10 px-1 py-1 border border-gray-300 rounded-lg"
+                title="Upper edge color"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Subtitle text color
+              </label>
+              <input
+                type="color"
+                value={subtitleTextColor}
+                onChange={(e) => setSubtitleTextColor(e.target.value)}
+                className="w-full h-10 px-1 py-1 border border-gray-300 rounded-lg"
+                title="Subtitle text color"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Subtitle edge color
+              </label>
+              <input
+                type="color"
+                value={subtitleEdgeColor}
+                onChange={(e) => setSubtitleEdgeColor(e.target.value)}
+                className="w-full h-10 px-1 py-1 border border-gray-300 rounded-lg"
+                title="Subtitle edge color"
+              />
             </div>
           </div>
 

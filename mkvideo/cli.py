@@ -25,6 +25,7 @@ from .pipeline.download import download_video, fetch_video_title
 from .pipeline.render import (
     cleanup_render_dir,
     get_video_info,
+    parse_hex_color,
     render_all_stories,
     scan_input_images,
 )
@@ -140,6 +141,26 @@ def main():
                         help="Pause after subtitle generation to manually edit SRT files")
     parser.add_argument("--bg-color", default="white", choices=["black", "white"],
                         help="Background color (default: white)")
+    parser.add_argument(
+        "--upper-text-color",
+        default="#000000",
+        help="Upper text color (#RRGGBB or #RGB, default: #000000)",
+    )
+    parser.add_argument(
+        "--upper-edge-color",
+        default="#FFDC00",
+        help="Upper text edge/stroke color (#RRGGBB or #RGB, default: #FFDC00)",
+    )
+    parser.add_argument(
+        "--subtitle-text-color",
+        default="#FFFFFF",
+        help="Subtitle text color (#RRGGBB or #RGB, default: #FFFFFF)",
+    )
+    parser.add_argument(
+        "--subtitle-edge-color",
+        default="#FF1493",
+        help="Subtitle edge/stroke color (#RRGGBB or #RGB, default: #FF1493)",
+    )
     parser.add_argument("--no-captions", action="store_true",
                         help="Skip subtitle overlay (upper hook text is always shown)")
     parser.add_argument("--output-dir", default="output")
@@ -246,6 +267,11 @@ def main():
 
     input_images = scan_input_images()
 
+    upper_text_color = parse_hex_color(args.upper_text_color, (0, 0, 0))
+    upper_edge_color = parse_hex_color(args.upper_edge_color, (255, 220, 0))
+    subtitle_text_color = parse_hex_color(args.subtitle_text_color, (255, 255, 255))
+    subtitle_edge_color = parse_hex_color(args.subtitle_edge_color, (255, 20, 147))
+
     output_paths = render_all_stories(
         video_path, stories, transcript, out_dir,
         max_duration=max_dur,
@@ -254,6 +280,10 @@ def main():
         input_images=input_images,
         video_title=video_title,
         review_subtitles=args.review_subtitles,
+        upper_text_color=upper_text_color,
+        upper_edge_color=upper_edge_color,
+        subtitle_text_color=subtitle_text_color,
+        subtitle_edge_color=subtitle_edge_color,
     )
 
     print(f"\n[5/5] Done! {len(output_paths)}/{len(stories)} stories -> {out_dir.resolve()}")

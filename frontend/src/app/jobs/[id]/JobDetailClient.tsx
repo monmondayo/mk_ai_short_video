@@ -26,6 +26,10 @@ type Job = {
   num_stories: number;
   duration_preset: string;
   bg_color: string;
+  upper_text_color: string;
+  upper_edge_color: string;
+  subtitle_text_color: string;
+  subtitle_edge_color: string;
   add_captions: boolean;
   error_message: string;
   created_at: string;
@@ -320,6 +324,14 @@ export default function JobDetailClient({
           <dd>{job.duration_preset}s</dd>
           <dt className="text-gray-500">Background</dt>
           <dd>{job.bg_color}</dd>
+          <dt className="text-gray-500">Upper text</dt>
+          <dd>{job.upper_text_color}</dd>
+          <dt className="text-gray-500">Upper edge</dt>
+          <dd>{job.upper_edge_color}</dd>
+          <dt className="text-gray-500">Subtitle text</dt>
+          <dd>{job.subtitle_text_color}</dd>
+          <dt className="text-gray-500">Subtitle edge</dt>
+          <dd>{job.subtitle_edge_color}</dd>
           <dt className="text-gray-500">Captions</dt>
           <dd>{job.add_captions ? "Yes" : "No"}</dd>
           <dt className="text-gray-500">Created</dt>

@@ -54,6 +54,27 @@ from .fonts import bg_rgb, find_system_font, load_font, sanitize_render_text
 from .text_layout import JANOME_TOKENIZER, wrap_and_fit, wrap_text
 
 
+def parse_hex_color(value: str | None, default: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Parse #RRGGBB / #RGB color strings, falling back to ``default`` on error."""
+    if not value:
+        return default
+
+    raw = value.strip()
+    if raw.startswith("#"):
+        raw = raw[1:]
+
+    if len(raw) == 3:
+        raw = "".join(ch * 2 for ch in raw)
+
+    if len(raw) != 6:
+        return default
+
+    try:
+        return tuple(int(raw[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+    except ValueError:
+        return default
+
+
 # ──────────────────────────────────────────
 # ffmpeg helpers
 # ──────────────────────────────────────────
@@ -161,7 +182,13 @@ def join_segments(clips: list[Path], transitions: list[str], out_path: Path) -> 
 # Text overlay images
 # ──────────────────────────────────────────
 def create_upper_text_image(
-    story: dict, bg_color: str, work_dir: Path, rank: int, video_title: str = ""
+    story: dict,
+    bg_color: str,
+    work_dir: Path,
+    rank: int,
+    video_title: str = "",
+    upper_text_color: tuple[int, int, int] = UPPER_FG,
+    upper_edge_color: tuple[int, int, int] = UPPER_STROKE,
 ) -> Path:
     VT_SIZE    = 20
     VT_GAP     = 4
@@ -198,21 +225,21 @@ def create_upper_text_image(
     if has_vt:
         for vt_line in vt_lines:
             draw.text((TARGET_W // 2, y), vt_line,
-                      font=vt_font, fill=UPPER_FG, anchor="mt",
-                      stroke_width=max(STROKE_W - 4, 2), stroke_fill=UPPER_STROKE)
+                      font=vt_font, fill=upper_text_color, anchor="mt",
+                      stroke_width=max(STROKE_W - 4, 2), stroke_fill=upper_edge_color)
             y += vt_lh
         y += VT_GAP
 
     for title_line in title_lines:
         draw.text((TARGET_W // 2, y), title_line,
-                  font=title_font, fill=UPPER_FG, anchor="mt",
-                  stroke_width=STROKE_W, stroke_fill=UPPER_STROKE)
+                  font=title_font, fill=upper_text_color, anchor="mt",
+                  stroke_width=STROKE_W, stroke_fill=upper_edge_color)
         y += title_lh
     y += TITLE_GAP
 
     for line in hook_lines:
-        draw.text((TARGET_W // 2, y), line, font=hook_font, fill=UPPER_FG, anchor="mt",
-                  stroke_width=STROKE_W, stroke_fill=UPPER_STROKE)
+        draw.text((TARGET_W // 2, y), line, font=hook_font, fill=upper_text_color, anchor="mt",
+                  stroke_width=STROKE_W, stroke_fill=upper_edge_color)
         y += hook_lh
 
     path = work_dir / f"s{rank}_upper.png"
@@ -220,7 +247,13 @@ def create_upper_text_image(
     return path
 
 
-def _render_subtitle_img(text: str, bg_color: str, font_path: str) -> Image.Image:
+def _render_subtitle_img(
+    text: str,
+    bg_color: str,
+    font_path: str,
+    subtitle_text_color: tuple[int, int, int] = LOWER_FG,
+    subtitle_edge_color: tuple[int, int, int] = LOWER_STROKE,
+) -> Image.Image:
     SUB_START_SIZE = 72
     TOP_PAD        = 8
     img  = Image.new("RGB", (TARGET_W, TEXT_PNG_H), bg_rgb(bg_color))
@@ -229,17 +262,29 @@ def _render_subtitle_img(text: str, bg_color: str, font_path: str) -> Image.Imag
     lines, font, line_h = wrap_and_fit(clean, font_path, SUB_START_SIZE, max_lines=3, min_size=24)
     y = TOP_PAD
     for line in lines:
-        draw.text((TARGET_W // 2, y), line, font=font, fill=LOWER_FG, anchor="mt",
-                  stroke_width=STROKE_W, stroke_fill=LOWER_STROKE)
+        draw.text((TARGET_W // 2, y), line, font=font, fill=subtitle_text_color, anchor="mt",
+                  stroke_width=STROKE_W, stroke_fill=subtitle_edge_color)
         y += line_h
     return img
 
 
 def create_subtitle_png(
-    text: str, bg_color: str, font_path: str, work_dir: Path, name: str
+    text: str,
+    bg_color: str,
+    font_path: str,
+    work_dir: Path,
+    name: str,
+    subtitle_text_color: tuple[int, int, int] = LOWER_FG,
+    subtitle_edge_color: tuple[int, int, int] = LOWER_STROKE,
 ) -> Path:
     path = work_dir / name
-    _render_subtitle_img(text, bg_color, font_path).save(path)
+    _render_subtitle_img(
+        text,
+        bg_color,
+        font_path,
+        subtitle_text_color=subtitle_text_color,
+        subtitle_edge_color=subtitle_edge_color,
+    ).save(path)
     return path
 
 
@@ -516,6 +561,8 @@ def create_subtitle_video(
     work_dir: Path,
     rank: int,
     input_images: list[Path],
+    subtitle_text_color: tuple[int, int, int] = LOWER_FG,
+    subtitle_edge_color: tuple[int, int, int] = LOWER_STROKE,
 ) -> tuple[Path, int]:
     font_path  = find_system_font()
     use_imgs   = bool(input_images)
@@ -537,13 +584,25 @@ def create_subtitle_video(
         if not use_imgs:
             if text is None:
                 return Image.new("RGB", (TARGET_W, frame_h), bg)
-            return _render_subtitle_img(text, bg_color, font_path)
+            return _render_subtitle_img(
+                text,
+                bg_color,
+                font_path,
+                subtitle_text_color=subtitle_text_color,
+                subtitle_edge_color=subtitle_edge_color,
+            )
 
         canvas = Image.new("RGB", (TARGET_W, BOTTOM_ZONE_H), bg)
         for j in range(2):
             canvas.paste(fit_image_in_box(imgs[j], img_w, img_row_h, bg), (j * img_w, 0))
         sub_y = img_row_h + IMG_GAP
-        sub_img = _render_subtitle_img(text, bg_color, font_path) if text else \
+        sub_img = _render_subtitle_img(
+            text,
+            bg_color,
+            font_path,
+            subtitle_text_color=subtitle_text_color,
+            subtitle_edge_color=subtitle_edge_color,
+        ) if text else \
                   Image.new("RGB", (TARGET_W, TEXT_PNG_H), bg)
         canvas.paste(sub_img, (0, sub_y))
         bot_y = sub_y + TEXT_PNG_H + IMG_GAP
@@ -611,10 +670,22 @@ def add_overlays(
     input_images: list[Path],
     video_title: str = "",
     srt_content: str | None = None,
+    upper_text_color: tuple[int, int, int] = UPPER_FG,
+    upper_edge_color: tuple[int, int, int] = UPPER_STROKE,
+    subtitle_text_color: tuple[int, int, int] = LOWER_FG,
+    subtitle_edge_color: tuple[int, int, int] = LOWER_STROKE,
 ) -> None:
     rank = story["rank"]
 
-    upper_png = create_upper_text_image(story, bg_color, work_dir, rank, video_title)
+    upper_png = create_upper_text_image(
+        story,
+        bg_color,
+        work_dir,
+        rank,
+        video_title,
+        upper_text_color=upper_text_color,
+        upper_edge_color=upper_edge_color,
+    )
 
     inputs = ["-i", str(joined_path), "-i", str(upper_png)]
 
@@ -624,7 +695,14 @@ def add_overlays(
         entries = parse_srt(srt_content)
         total_dur = get_clip_duration(joined_path)
         sub_video, sub_y = create_subtitle_video(
-            entries, total_dur, bg_color, work_dir, rank, input_images
+            entries,
+            total_dur,
+            bg_color,
+            work_dir,
+            rank,
+            input_images,
+            subtitle_text_color=subtitle_text_color,
+            subtitle_edge_color=subtitle_edge_color,
         )
         inputs += ["-i", str(sub_video)]
         filter_complex = (
@@ -727,6 +805,10 @@ def render_story(
     input_images: list[Path],
     max_total_duration: float,
     video_title: str = "",
+    upper_text_color: tuple[int, int, int] = UPPER_FG,
+    upper_edge_color: tuple[int, int, int] = UPPER_STROKE,
+    subtitle_text_color: tuple[int, int, int] = LOWER_FG,
+    subtitle_edge_color: tuple[int, int, int] = LOWER_STROKE,
 ) -> Path:
     rank = story["rank"]
     safe_title = "".join(
@@ -741,6 +823,10 @@ def render_story(
         joined_path, story, transcript_segs, durations,
         work_dir, out_path, bg_color, add_captions, input_images, video_title,
         srt_content=srt_content or None,
+        upper_text_color=upper_text_color,
+        upper_edge_color=upper_edge_color,
+        subtitle_text_color=subtitle_text_color,
+        subtitle_edge_color=subtitle_edge_color,
     )
     return out_path
 
@@ -759,6 +845,10 @@ def render_all_stories(
     input_images: list[Path] = [],
     video_title: str = "",
     review_subtitles: bool = False,
+    upper_text_color: tuple[int, int, int] = UPPER_FG,
+    upper_edge_color: tuple[int, int, int] = UPPER_STROKE,
+    subtitle_text_color: tuple[int, int, int] = LOWER_FG,
+    subtitle_edge_color: tuple[int, int, int] = LOWER_STROKE,
 ) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     work_dir = _const.TEMP_DIR / "render"
@@ -831,6 +921,10 @@ def render_all_stories(
                     joined_path, story, transcript_segs, durations,
                     work_dir, out_path, bg_color, add_captions, input_images, video_title,
                     srt_content=srt_content,
+                    upper_text_color=upper_text_color,
+                    upper_edge_color=upper_edge_color,
+                    subtitle_text_color=subtitle_text_color,
+                    subtitle_edge_color=subtitle_edge_color,
                 )
                 size_mb = out_path.stat().st_size / 1024 / 1024
                 print(f"-> {out_path.name} ({size_mb:.1f} MB)")
@@ -856,6 +950,10 @@ def render_all_stories(
                     out_dir, work_dir, bg_color, add_captions, input_images,
                     max_total_duration=max_total,
                     video_title=video_title,
+                    upper_text_color=upper_text_color,
+                    upper_edge_color=upper_edge_color,
+                    subtitle_text_color=subtitle_text_color,
+                    subtitle_edge_color=subtitle_edge_color,
                 )
                 size_mb = p.stat().st_size / 1024 / 1024
                 print(f"-> {p.name} ({size_mb:.1f} MB)")

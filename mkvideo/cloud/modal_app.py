@@ -567,6 +567,7 @@ def render_videos_job(
     from mkvideo.pipeline.render import (
         add_overlays,
         get_clip_duration,
+        parse_hex_color,
         render_all_stories,
     )
     from mkvideo.storage.r2 import R2Storage
@@ -615,6 +616,10 @@ def render_videos_job(
             video_title = _strip_video_extension(
                 job.get("video_title", job.get("youtube_url", ""))
             )
+            upper_text_color = parse_hex_color(job.get("upper_text_color"), (0, 0, 0))
+            upper_edge_color = parse_hex_color(job.get("upper_edge_color"), (255, 220, 0))
+            subtitle_text_color = parse_hex_color(job.get("subtitle_text_color"), (255, 255, 255))
+            subtitle_edge_color = parse_hex_color(job.get("subtitle_edge_color"), (255, 20, 147))
 
             db.update_job_status(job_id, "rendering")
 
@@ -660,6 +665,10 @@ def render_videos_job(
                             durations, work_dir, out_path,
                             bg_color, add_captions, input_images, video_title,
                             srt_content=srt_content,
+                            upper_text_color=upper_text_color,
+                            upper_edge_color=upper_edge_color,
+                            subtitle_text_color=subtitle_text_color,
+                            subtitle_edge_color=subtitle_edge_color,
                         )
                     except Exception as e:
                         print(f"[render_videos_job] story #{rank} overlay failed: {e}")
@@ -677,6 +686,10 @@ def render_videos_job(
                     add_captions=add_captions,
                     input_images=input_images,
                     video_title=video_title,
+                    upper_text_color=upper_text_color,
+                    upper_edge_color=upper_edge_color,
+                    subtitle_text_color=subtitle_text_color,
+                    subtitle_edge_color=subtitle_edge_color,
                 )
 
             # ── Upload results + record in DB ────────────────────────
