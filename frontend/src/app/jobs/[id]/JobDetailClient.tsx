@@ -66,6 +66,11 @@ export default function JobDetailClient({
   const router = useRouter();
   const supabase = createClient();
   const [error, setError] = useState("");
+  const [captionEnabled, setCaptionEnabled] = useState(job.add_captions);
+  const [savingCaptionSetting, setSavingCaptionSetting] = useState(false);
+  const [captionSettingMsg, setCaptionSettingMsg] = useState<string | null>(
+    null,
+  );
 
   /** Phase 2a: after transcript review → kick off Claude extraction. */
   const handleStartExtract = async () => {
@@ -102,7 +107,7 @@ export default function JobDetailClient({
         job_id: job.id,
         duration_preset: job.duration_preset,
         bg_color: job.bg_color,
-        add_captions: job.add_captions,
+        add_captions: captionEnabled,
       });
 
       await supabase
@@ -168,6 +173,32 @@ export default function JobDetailClient({
     subtitles &&
     Object.keys(subtitles).length > 0;
 
+  const handleCaptionToggle = async (enabled: boolean) => {
+    const previous = captionEnabled;
+    setCaptionEnabled(enabled);
+    setSavingCaptionSetting(true);
+    setCaptionSettingMsg(null);
+
+    const { data, error: updateError } = await supabase
+      .from("jobs")
+      .update({ add_captions: enabled })
+      .eq("id", job.id)
+      .select("id");
+
+    if (updateError || !data || data.length === 0) {
+      setCaptionEnabled(previous);
+      setCaptionSettingMsg(
+        updateError
+          ? `Save failed: ${updateError.message}`
+          : "Save failed: no rows updated",
+      );
+    } else {
+      setCaptionSettingMsg("Saved");
+      router.refresh();
+    }
+    setSavingCaptionSetting(false);
+  };
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -210,6 +241,40 @@ export default function JobDetailClient({
         <div className="bg-red-50 border border-red-200 rounded-lg p-4">
           <h3 className="font-medium text-red-800">Error</h3>
           <p className="text-sm text-red-600 mt-1">{job.error_message}</p>
+        </div>
+      )}
+
+      {!isProcessing && (
+        <div className="border border-gray-200 rounded-lg bg-white p-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="text-sm font-semibold text-gray-900">
+                Caption Rendering
+              </h2>
+              <p className="text-sm text-gray-500">
+                最終レンダーで下部字幕を合成するかを切り替えます。
+              </p>
+            </div>
+            <label className="inline-flex items-center gap-2 text-sm text-gray-700">
+              <input
+                type="checkbox"
+                checked={captionEnabled}
+                disabled={savingCaptionSetting}
+                onChange={(e) => handleCaptionToggle(e.target.checked)}
+                className="rounded"
+              />
+              Add captions
+            </label>
+          </div>
+          {captionSettingMsg && (
+            <p
+              className={`mt-2 text-sm ${
+                captionSettingMsg === "Saved" ? "text-green-600" : "text-red-600"
+              }`}
+            >
+              {captionSettingMsg}
+            </p>
+          )}
         </div>
       )}
 
@@ -333,7 +398,7 @@ export default function JobDetailClient({
           <dt className="text-gray-500">Subtitle edge</dt>
           <dd>{job.subtitle_edge_color}</dd>
           <dt className="text-gray-500">Captions</dt>
-          <dd>{job.add_captions ? "Yes" : "No"}</dd>
+          <dd>{captionEnabled ? "Yes" : "No"}</dd>
           <dt className="text-gray-500">Created</dt>
           <dd>
             {new Date(job.created_at).toLocaleString("ja-JP")}

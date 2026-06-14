@@ -1,7 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase-browser";
+import { getDownloadUrl } from "@/lib/modal-api";
 
 /**
  * SRT payload saved by ``prepare_subtitles_job`` into
@@ -65,6 +66,41 @@ export default function SubtitleEditor({
   const [continuing, setContinuing] = useState(false);
   const [saved, setSaved] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [previewUrls, setPreviewUrls] = useState<Record<string, string>>({});
+  const [previewError, setPreviewError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const entries = Object.entries(initialSubtitles).filter(
+      ([, entry]) => entry.joined_key,
+    );
+    if (!entries.length) return;
+
+    Promise.all(
+      entries.map(async ([rank, entry]) => {
+        const { view_url } = await getDownloadUrl({
+          job_id: jobId,
+          key: entry.joined_key,
+          filename: `story-${rank}-joined.mp4`,
+        });
+        return [rank, view_url] as const;
+      }),
+    )
+      .then((pairs) => {
+        if (!cancelled) setPreviewUrls(Object.fromEntries(pairs));
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setPreviewError(
+            e instanceof Error ? e.message : "Failed to load preview videos",
+          );
+        }
+      })
+
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId, initialSubtitles]);
 
   const updateSrt = (rank: number, srt: string) => {
     setSubtitles((prev) => {
@@ -181,6 +217,12 @@ export default function SubtitleEditor({
         </div>
       )}
 
+      {previewError && (
+        <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-sm text-amber-800">
+          Preview videos could not be loaded: {previewError}
+        </div>
+      )}
+
       <ul className="space-y-3">
         {ordered.map((story) => {
           const key = String(story.rank);
@@ -226,14 +268,36 @@ export default function SubtitleEditor({
                 </div>
               </div>
 
-              <textarea
-                value={entry.srt}
-                onChange={(e) => updateSrt(story.rank, e.target.value)}
-                rows={Math.min(20, Math.max(6, entry.srt.split("\n").length))}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-xs font-mono resize-y whitespace-pre"
-                spellCheck={false}
-                placeholder="1&#10;00:00:00,000 --> 00:00:02,500&#10;字幕テキスト"
-              />
+              <div className="grid gap-4 lg:grid-cols-[minmax(240px,360px)_minmax(0,1fr)]">
+                <div className="space-y-2">
+                  <div className="aspect-[9/16] max-h-[560px] overflow-hidden rounded-lg bg-gray-950">
+                    {previewUrls[key] ? (
+                      <video
+                        src={previewUrls[key]}
+                        controls
+                        preload="metadata"
+                        className="h-full w-full object-contain"
+                      />
+                    ) : (
+                      <div className="flex h-full items-center justify-center px-4 text-center text-sm text-gray-300">
+                        {previewError ? "Preview unavailable" : "Loading preview..."}
+                      </div>
+                    )}
+                  </div>
+                  <p className="text-xs text-gray-500">
+                    字幕合成前の切り出し済みショート動画
+                  </p>
+                </div>
+
+                <textarea
+                  value={entry.srt}
+                  onChange={(e) => updateSrt(story.rank, e.target.value)}
+                  rows={Math.min(24, Math.max(12, entry.srt.split("\n").length))}
+                  className="min-h-[360px] w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-xs font-mono resize-y whitespace-pre"
+                  spellCheck={false}
+                  placeholder="1&#10;00:00:00,000 --> 00:00:02,500&#10;字幕テキスト"
+                />
+              </div>
             </li>
           );
         })}
